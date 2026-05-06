@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+*.egg
+
+# Model checkpoints (large binaries)
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Datasets & game records (huge)
+dataset/
+records/
+
+# Node / frontend
+node_modules/
+package-lock.json
+dist/
+
+# IDE
+.vscode/
+.idea/
+
+# Temp / logs
+.tmp/
+*.log
+
+# Web artifacts (not part of the training framework)
+console.html
+index.html
+
+# Figures / diagrams
+figures/
+fig.txt
+
+# Claude
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db

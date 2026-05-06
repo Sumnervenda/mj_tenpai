@@ -1,0 +1,22 @@
+# 疯狗狂战 — 极限争一型
+personality: mad_dog
+description: "赢者通吃，不防守，疯狂副露推进向听数"
+
+reward:
+  first_place_bonus: 1000.0
+  early_win_bonus: 50.0
+  early_win_turn_threshold: 6
+
+training:
+  lr: 3.0e-4
+  clip_epsilon: 0.2
+  gamma: 0.99
+  gae_lambda: 0.95
+  entropy_coef: 0.005         # 较低熵：利用激进模式
+  value_loss_coef: 0.5
+  max_grad_norm: 1.0
+  num_envs: 64
+  rollout_steps: 2048
+  ppo_epochs: 10
+  mini_batch_size: 1024
+  use_amp: true
