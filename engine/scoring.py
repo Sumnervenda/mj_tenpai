@@ -295,6 +295,7 @@ def compute_payments(
     num_yakuman: int = 0,
     honba: int = 0,
     riichi_sticks_on_table: int = 0,
+    dealer_idx: int = 0,
 ) -> PaymentInfo:
     """计算一次和牌的各家支付额。
 
@@ -326,7 +327,7 @@ def compute_payments(
             # 闲家自摸：子家付 tsumo_ko_pay，親家付 tsumo_oya_pay
             for p in range(4):
                 if p != winner:
-                    if p == 0:  # 庄家始终为 player 0（此处语境下）
+                    if p == dealer_idx:
                         payments[p] = -tsumo_oya_pay
                         total_win += tsumo_oya_pay
                     else:

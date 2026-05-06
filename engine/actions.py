@@ -113,9 +113,11 @@ def set_ron_action(mask: List[int], can_ron: bool) -> None:
 
 
 def set_riichi_actions(mask: List[int], riichi_discards: List[int]) -> None:
-    """标记立直及对应的切牌选择。"""
+    """标记立直切牌选择（索引 37-70，每个索引绑定具体切牌）。
+
+    注：不开放 mask[36]（独立立直按钮），因当前动作空间用 37-70 表示完整立直+切牌。
+    """
     if riichi_discards:
-        mask[RIICHI_INDEX] = 1
         for t in riichi_discards:
             mask[RIICHI_DISCARD_OFFSET + t] = 1
 
@@ -176,9 +178,9 @@ def compute_draw_actions(
         actions.append(Action(ActionType.TSUMO, tile=last_drawn_tile))
         mask[TSUMO_INDEX] = 1
 
-    # 立直 + 切牌组合
+    # 立直 + 切牌组合（动作索引 37-70，每个索引绑定具体切牌）
+    # 注：不开放 mask[36]（独立立直按钮），因当前动作空间用 37-70 表示完整立直+切牌
     if can_riichi:
-        mask[RIICHI_INDEX] = 1
         for t in riichi_discards:
             actions.append(Action(ActionType.RIICHI, tile=t))
             mask[RIICHI_DISCARD_OFFSET + t] = 1

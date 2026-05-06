@@ -224,7 +224,15 @@ class GameEngine:
         self.wall.shuffle()
 
         # 配牌：庄家 14 张，闲家各 13 张
-        hands = self.wall.deal()  # 返回 (14, 13, 13, 13) 绝对 ID 四元组
+        # Wall.deal() 返回 (14, 13, 13, 13)；需按 dealer_idx 重排
+        raw_hands = self.wall.deal()
+        hands = [None] * 4
+        other_hands = list(raw_hands[1:])  # 三份 13 张
+        for p_idx in range(4):
+            if p_idx == self.dealer_idx:
+                hands[p_idx] = raw_hands[0]  # 14 张给庄家
+            else:
+                hands[p_idx] = other_hands.pop(0)
         for p_idx, tiles in enumerate(hands):
             for abs_id in tiles:
                 t = abs_to_type(abs_id)
@@ -242,14 +250,14 @@ class GameEngine:
         self.phase = GamePhase.DRAW
 
     def _seat_wind_for(self, player_idx: int) -> int:
-        """根据玩家位置和场风计算自风。
+        """根据玩家与庄家的相对位置计算自风。
 
-        规则：庄家 = 场风，其余顺时针排列（東→南→西→北）。
+        规则：庄家 = 東，下家 = 南，对家 = 西，上家 = 北。
+        自风与场风无关；场风只影响 bakaze 役。
         """
         winds = [27, 28, 29, 30]  # 東南西北
         offset = (player_idx - self.dealer_idx) % 4
-        base_wind_idx = winds.index(self.round_wind)
-        return winds[(base_wind_idx + offset) % 4]
+        return winds[offset]
 
     # ── 主步进函数 ────────────────────────────────────────────────────────
 
@@ -703,7 +711,7 @@ class GameEngine:
                     open_melds=winner_player.hand.melds,
                     pair=decomp.pair,
                     is_menzen=winner_player.hand.is_menzen,
-                    is_tsumo=True,
+                    is_tsumo=is_tsumo,
                     is_pinfu=any(y == Yaku.PINFU for y, _ in yaku_result.yaku_list),
                     bakaze=self.round_wind,
                     jikaze=winner_player.seat_wind,
@@ -742,6 +750,7 @@ class GameEngine:
             is_tsumo=is_tsumo,
             loser=loser,
             num_yakuman=num_yakuman,
+            dealer_idx=self.dealer_idx,
             honba=self.honba,
             riichi_sticks_on_table=self.riichi_sticks,
         )

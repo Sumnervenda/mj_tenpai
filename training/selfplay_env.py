@@ -104,8 +104,6 @@ class SelfPlayEnv:
             return Action(ActionType.TSUMO, actor=actor)
         elif action_idx == 35:
             return Action(ActionType.RON, actor=actor)
-        elif action_idx == 36:
-            return Action(ActionType.RIICHI, actor=actor)
         elif 37 <= action_idx <= 70:
             return Action(ActionType.RIICHI,
                           tile=action_idx - 37, actor=actor)

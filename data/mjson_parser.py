@@ -324,12 +324,14 @@ class MJSONGameTracker:
         return state
 
     def _seat_wind(self, player_idx: int) -> int:
-        """根据 oya 和 bakaze 计算自风。"""
-        winds = [27, 28, 29, 30]
-        oya_wind = self.bakaze
-        oya_wind_idx = winds.index(oya_wind)
+        """根据玩家与庄家的相对位置计算自风。
+
+        庄家 = 東，下家 = 南，对家 = 西，上家 = 北。
+        自风与场风无关；场风只影响 bakaze 役。
+        """
+        winds = [27, 28, 29, 30]  # 東南西北
         offset = (player_idx - self.oya) % 4
-        return winds[(oya_wind_idx + offset) % 4]
+        return winds[offset]
 
     # ── 合法动作掩码 ────────────────────────────────────────────────────
 
