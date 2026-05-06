@@ -1,3 +1,4 @@
+--
 # Mahjong DL-Engine + Frontend Console
 
 本项目包含两部分：
@@ -232,5 +233,6 @@ Python 契约出口：
 - `CHINESE_GUIDE.md`：完整中文开发手册。
 - `Engine_control_readme.md`：前端控制台需求说明。
 - `index.html`：旧静态麻将桌布局参考。
-#   m j _ t e n p a i  
+#   m j _ t e n p a i 
+ --
  
