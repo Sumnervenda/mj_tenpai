@@ -88,19 +88,16 @@ class SelfPlayEnv:
                             legal: LegalActions) -> Action:
         """将动作索引转换回 Action 对象。
 
-        77 维动作空间映射:
-          0-33:   切牌 (discard tile type 0-33)
-          34:     自摸
-          35:     荣和
-          36:     立直
-          37-70:  立直切牌 (riichi + discard type 0-33)
-          71:     碰
-          72:     吃
-          73:     大明槓
-          74:     暗槓
-          75:     加槓
-          76:     パス
+        优先从 legal.actions 中反查匹配的具体 Action（保留 tile/meld_tiles）。
+        兜底：按动作索引直接构造（兼容未在 actions 列表中的动作类型）。
         """
+        # ── 从 legal.actions 反查，保留完整动作信息 ──
+        for action in legal.actions:
+            if self._action_to_index(action) == action_idx:
+                action.actor = actor
+                return action
+
+        # ── 兜底：按动作索引直接构造 ──
         if 0 <= action_idx <= 33:
             return Action(ActionType.DISCARD, tile=action_idx, actor=actor)
         elif action_idx == 34:
@@ -126,6 +123,34 @@ class SelfPlayEnv:
             return Action(ActionType.PASS, actor=actor)
         else:
             return Action(ActionType.PASS, actor=actor)
+
+    @staticmethod
+    def _action_to_index(action: Action) -> int:
+        """将 Action 对象映射到 77 维动作空间中的索引。"""
+        at = action.action_type
+        if at == ActionType.DISCARD:
+            return action.tile  # 0-33
+        elif at == ActionType.TSUMO:
+            return 34
+        elif at == ActionType.RON:
+            return 35
+        elif at == ActionType.RIICHI:
+            if 0 <= action.tile <= 33:
+                return 37 + action.tile
+            return 36
+        elif at == ActionType.PON:
+            return 71
+        elif at == ActionType.CHI:
+            return 72
+        elif at == ActionType.KAN_DAIMIN:
+            return 73
+        elif at == ActionType.KAN_ANKAN:
+            return 74
+        elif at == ActionType.KAN_KAKAN:
+            return 75
+        elif at == ActionType.PASS:
+            return 76
+        return 76
 
     def run_game(self, seed: Optional[int] = None) -> GameTrajectory:
         """运行一局完整自对弈，收集全轨迹。

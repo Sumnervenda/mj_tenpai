@@ -182,6 +182,7 @@ class GameEngine:
         self.round_number = 1
         self.honba = 0           # 本场数
         self.riichi_sticks = 0   # 场上积存的立直棒数量
+        self.dealer_idx = 0      # 当前庄家索引 (0-3)
         self.current_player = 0  # 当前摸牌/切牌玩家
         self.last_discard = -1   # 最近舍牌的绝对 ID
         self.last_discard_by = -1  # 最近舍牌的玩家
@@ -215,9 +216,9 @@ class GameEngine:
     def _start_round(self) -> None:
         """开始新的一局：洗牌、配牌、翻开宝牌指示牌。"""
         # 清除每局状态
-        for p in self.players:
+        for p_idx, p in enumerate(self.players):
             p.clear_round_state()
-            p.seat_wind = self._seat_wind_for(p)
+            p.seat_wind = self._seat_wind_for(p_idx)
 
         self.wall.reset()
         self.wall.shuffle()
@@ -233,22 +234,22 @@ class GameEngine:
         self.wall.flip_dora()
         self.ura_dora_indicators = []
 
-        self.current_player = 0   # 庄家先手
+        self.current_player = self.dealer_idx   # 庄家先手
         self.last_discard = -1
         self.last_discard_by = -1
-        self.honba = 0            # 本场数（庄家连荘时递增）
+        # 本场数由 _step_agari_settlement / _step_ryuukyoku_settlement 管理，
+        # _start_round 不重置，以保留连荘积点。
         self.phase = GamePhase.DRAW
 
-    def _seat_wind_for(self, player: PlayerState) -> int:
+    def _seat_wind_for(self, player_idx: int) -> int:
         """根据玩家位置和场风计算自风。
 
-        规则：P0 = 庄家 = 场风，其余顺时针排列（東→南→西→北）。
+        规则：庄家 = 场风，其余顺时针排列（東→南→西→北）。
         """
-        idx = self.players.index(player) if player in self.players else 0
-        base = self.round_wind  # 27=東, 28=南
         winds = [27, 28, 29, 30]  # 東南西北
-        offset = idx
-        return winds[(winds.index(base) + offset) % 4]
+        offset = (player_idx - self.dealer_idx) % 4
+        base_wind_idx = winds.index(self.round_wind)
+        return winds[(base_wind_idx + offset) % 4]
 
     # ── 主步进函数 ────────────────────────────────────────────────────────
 
@@ -321,7 +322,7 @@ class GameEngine:
     def _step_agari_settlement(self) -> None:
         """和了后精算：处理支付，判断庄家连荘或轮庄。"""
         winner = self._last_winner
-        if winner == 0:
+        if winner == self.dealer_idx:
             # 庄家和了：本场 +1，不轮庄
             self.honba += 1
         else:
@@ -370,7 +371,7 @@ class GameEngine:
         # 场上立直棒保留至下一局
 
         # 听牌连荘规则：庄家听牌则连荘
-        if self.players[0].is_tenpai_at_ryuukyoku and self.config.tenpai_renchan:
+        if self.players[self.dealer_idx].is_tenpai_at_ryuukyoku and self.config.tenpai_renchan:
             self.honba += 1
         else:
             self._rotate_winds()
@@ -683,7 +684,7 @@ class GameEngine:
           6. 立直棒归和牌者
         """
         winner_player = self.players[winner]
-        is_dealer = winner == 0
+        is_dealer = winner == self.dealer_idx
 
         # 役满处理：不使用符/翻表，直接查役满得点
         han = yaku_result.total_han
@@ -816,10 +817,10 @@ class GameEngine:
             is_ippatsu=player.is_ippatsu and player.is_riichi,
             is_double_riichi=player.is_double_riichi,
             # 天和：庄家配牌 14 张即和牌（非摸牌后），故 winning_tile=-1
-            is_tenhou=(winner == 0 and len(player.discards) == 0 and is_tsumo
+            is_tenhou=(winner == self.dealer_idx and len(player.discards) == 0 and is_tsumo
                        and self._last_drawn_tile == -1),
             # 地和：闲家第一巡摸牌即和（此前无人鸣牌/舍牌）
-            is_chiihou=(winner != 0 and len(player.discards) == 0 and is_tsumo),
+            is_chiihou=(winner != self.dealer_idx and len(player.discards) == 0 and is_tsumo),
             bakaze=self.round_wind,
             jikaze=player.seat_wind,
             kuitan=self.config.kuitan,
@@ -834,11 +835,9 @@ class GameEngine:
         """局间风位轮转。
 
         规则：
-          - 每局结束后自风逆时针旋转（东→北→西→南→东）
+          - 庄家按顺时针轮转（P0→P1→P2→P3→P0）
           - 東 4 局后（東風战直接结束），场风变为南，再 4 局后游戏结束
         """
-        winds = [27, 28, 29, 30]  # 東南西北
-
         self.round_number += 1
 
         if self.round_number > 4:
@@ -853,13 +852,8 @@ class GameEngine:
                 # 東風战 4 局结束 → 游戏终结
                 self._game_finished = True
 
-        # 自风逆时针旋转：东→北, 南→东, 西→南, 北→西
-        prev_winds = [p.seat_wind for p in self.players]
-        wind_order = [27, 28, 29, 30]
-        for p in self.players:
-            cur = p.seat_wind
-            idx = wind_order.index(cur)
-            p.seat_wind = wind_order[(idx - 1) % 4]  # 逆时针移动
+        # 庄家顺时针轮转
+        self.dealer_idx = (self.dealer_idx + 1) % 4
 
     def _check_game_end(self) -> bool:
         """检查游戏是否应该结束。
@@ -1107,9 +1101,9 @@ class GameEngine:
             is_riichi=player.is_riichi,
             is_ippatsu=player.is_ippatsu and player.is_riichi,
             is_double_riichi=player.is_double_riichi,
-            is_tenhou=(player_idx == 0 and len(player.discards) == 0 and is_tsumo
+            is_tenhou=(player_idx == self.dealer_idx and len(player.discards) == 0 and is_tsumo
                        and self._last_drawn_tile == -1),
-            is_chiihou=(player_idx != 0 and len(player.discards) == 0 and is_tsumo),
+            is_chiihou=(player_idx != self.dealer_idx and len(player.discards) == 0 and is_tsumo),
             bakaze=self.round_wind,
             jikaze=player.seat_wind,
             kuitan=self.config.kuitan,

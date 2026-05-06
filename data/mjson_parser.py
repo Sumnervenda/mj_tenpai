@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from engine.tile import NUM_TYPES
+from engine.agari import get_legal_discards_for_riichi
 from .record_parser import TrainingSample
 
 # ── MJSON tile code → engine type_id (0-33) 映射 ──────────────────────────
@@ -348,9 +349,9 @@ class MJSONGameTracker:
         # 立直判定：门清、未立直、分数 >= 1000、听牌
         can_riichi = self._can_riichi(player_idx)
         if can_riichi:
-            for t in range(34):
-                if hand[t] > 0:
-                    mask[37 + t] = 1.0
+            riichi_discards = get_legal_discards_for_riichi(list(hand))
+            for t in riichi_discards:
+                mask[37 + t] = 1.0
 
         # 暗槓
         if not self.is_riichi[player_idx]:
@@ -370,7 +371,7 @@ class MJSONGameTracker:
         return mask
 
     def _can_riichi(self, player_idx: int) -> bool:
-        """简单判定是否可立直：门清 + 未立直 + 分数 >= 1000。"""
+        """判定是否可立直：门清 + 未立直 + 分数 >= 1000 + 存在听牌切牌。"""
         if self.is_riichi[player_idx]:
             return False
         if self.scores[player_idx] < 1000:
@@ -379,7 +380,9 @@ class MJSONGameTracker:
         for _, _, called_from in self.melds[player_idx]:
             if called_from >= 0:
                 return False
-        return True
+        # 检查是否存在至少一种切牌能听牌
+        hand = list(self.hands[player_idx])
+        return len(get_legal_discards_for_riichi(hand)) > 0
 
     def build_response_mask(self, player_idx: int) -> np.ndarray:
         """构建别家切牌后的响应动作掩码。
@@ -613,17 +616,34 @@ class MJSONRecordParser:
 
             # ── 其他玩家 pass 决策 ──
             elif etype == 'dahai':
-                # 当 A 切牌后，其他玩家的 pass 也构成负样本
-                # 记录那些选择了 pass（而未鸣牌/和牌）的玩家的决策
+                # 当 A 切牌后，为有响应能力但未鸣牌/和牌的玩家生成 pass 样本
                 discarding_player = event['actor']
+                responding_players: set = set()
+                # 扫描后续事件，找出实际做出了响应的玩家
+                for ne in events[i+1:]:
+                    nt = ne.get('type', '')
+                    if nt in ('chi', 'pon', 'daiminkan', 'hora', 'ankan', 'kakan'):
+                        responding_players.add(ne.get('actor', -1))
+                    elif nt in ('tsumo', 'dahai', 'reach', 'ryukyoku'):
+                        break  # 响应窗口关闭
                 for p_idx in range(4):
                     if p_idx == discarding_player:
                         continue
                     if tracker.is_riichi[p_idx]:
-                        continue  # 立直者必须 pass（不产生决策样本）
-                    # 检查是否有其他玩家对这张牌做了动作
-                    # 这里不做过度采样——仅在 game 结束批量处理
-                    pass
+                        continue  # 立直者必须 pass
+                    if p_idx in responding_players:
+                        continue  # 已鸣牌/和牌
+                    resp_mask = tracker.build_response_mask(p_idx)
+                    # 仅当玩家确实有鸣牌/和牌选项（不只是纯 pass）时才记录
+                    if resp_mask[35] > 0 or resp_mask[71] > 0 \
+                            or resp_mask[72] > 0 or resp_mask[73] > 0:
+                        state = tracker.build_state_tensor(p_idx)
+                        samples.append(TrainingSample(
+                            state_tensor=state,
+                            action_mask=resp_mask,
+                            chosen_action=76,  # PASS
+                            player_idx=p_idx,
+                        ))
 
         return samples
 
