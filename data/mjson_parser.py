@@ -19,6 +19,17 @@ from engine.tile import NUM_TYPES
 from engine.agari import get_legal_discards_for_riichi
 from .record_parser import TrainingSample
 
+try:
+    import orjson as _orjson
+except ImportError:  # pragma: no cover - optional speed dependency
+    _orjson = None
+
+
+def _loads_json_line(line: bytes):
+    if _orjson is not None:
+        return _orjson.loads(line)
+    return json.loads(line)
+
 # ── MJSON tile code → engine type_id (0-33) 映射 ──────────────────────────
 
 # 数牌: "1m".."9m" → 0-8, "1p".."9p" → 9-17, "1s".."9s" → 18-26
@@ -455,14 +466,14 @@ class MJSONRecordParser:
         events = []
         try:
             if self._is_gzipped(filepath):
-                opener = gzip.open(filepath, 'rt', encoding='utf-8')
+                opener = gzip.open(filepath, 'rb')
             else:
-                opener = open(filepath, 'r', encoding='utf-8')
+                opener = open(filepath, 'rb')
             with opener as f:
                 for line in f:
                     line = line.strip()
                     if line:
-                        events.append(json.loads(line))
+                        events.append(_loads_json_line(line))
         except (EOFError, json.JSONDecodeError) as e:
             if self.verbose:
                 print(f"  Skipping {filepath}: {e}")
@@ -701,3 +712,4 @@ class MJSONRecordParser:
                 tracker.hands[actor][t] += 1
             if tracker.melds[actor]:
                 tracker.melds[actor].pop()
+# 中文注释：解析雀魂/Tenhou 转换后的 MJSON 牌谱，并抽取状态、动作、mask 三元组。

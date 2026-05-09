@@ -254,3 +254,4 @@ def compute_response_actions(
     mask[PASS_INDEX] = 1
 
     return LegalActions(actions=actions, mask=mask)
+# 中文注释：定义麻将动作、动作空间编码以及合法动作 mask 的构造逻辑。

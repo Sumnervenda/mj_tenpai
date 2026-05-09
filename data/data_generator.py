@@ -137,3 +137,4 @@ class HeuristicAgent:
 
         scored.sort(key=lambda x: -x[0])
         return scored[0][1]
+# 中文注释：用内置启发式策略生成训练记录，便于没有外部牌谱时做监督学习冒烟数据。

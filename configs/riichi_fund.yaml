@@ -6,7 +6,7 @@ reward:
   chi_pon_penalty: -50.0
   riichi_bonus: 300.0
 
-training:
+rl_training:
   lr: 3.0e-4
   clip_epsilon: 0.2
   gamma: 0.99
@@ -19,3 +19,4 @@ training:
   ppo_epochs: 10
   mini_batch_size: 1024
   use_amp: true
+# 中文注释：立直基础策略训练配置，偏向标准牌理与常规奖励权重。

@@ -163,3 +163,4 @@ def all_tile_types() -> List[int]:
 def all_abs_ids() -> List[int]:
     """返回全部 136 张牌的绝对 ID。"""
     return list(range(NUM_ABS))
+# 中文注释：处理牌 ID、牌面编码、红五和显示名称之间的转换。

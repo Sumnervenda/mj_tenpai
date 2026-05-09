@@ -159,3 +159,4 @@ class JSONLRecordParser:
             return state
         except Exception:
             return None
+# 中文注释：定义通用训练样本结构，并解析 JSONL 记录为模型可训练的张量样本。

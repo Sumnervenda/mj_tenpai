@@ -122,3 +122,4 @@ class TestTileNames:
         assert tile_name(91) == "赤5s"
         # Normal copy of aka type
         assert tile_name(16) == "5m"
+# 中文注释：验证牌编码、红五、显示名称和 ID 映射等基础工具函数。

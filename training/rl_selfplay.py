@@ -73,7 +73,7 @@ def load_training_config(config_path: str) -> dict:
         import yaml
         with open(config_path, 'r', encoding='utf-8') as f:
             raw = yaml.safe_load(f)
-        training = raw.get('training', {})
+        training = raw.get('rl_training') or raw.get('training', {})
         cfg['lr'] = training.get('lr', 3e-4)
         cfg['clip_epsilon'] = training.get('clip_epsilon', 0.2)
         cfg['gamma'] = training.get('gamma', 0.99)
@@ -83,26 +83,57 @@ def load_training_config(config_path: str) -> dict:
         cfg['max_grad_norm'] = training.get('max_grad_norm', 1.0)
         cfg['ppo_epochs'] = training.get('ppo_epochs', 10)
         cfg['mini_batch_size'] = training.get('mini_batch_size', 256)
+        cfg['kl_coef'] = training.get('kl_coef', 0.01)
     except Exception:
         pass
     return cfg
 
 
 def run_eval(model: MahjongPolicyValueNet, num_games: int,
-             device: str) -> dict:
-    """运行评估：使用确定性策略对弈，记录胜率。"""
-    env = SelfPlayEnv(model, device=device, deterministic=True)
-    wins = [0, 0, 0, 0]
+             device: str,
+             baseline_model: MahjongPolicyValueNet | None = None,
+             trainee_idx: int = 0) -> dict:
+    """运行评估：trainee vs frozen baseline，只统计 trainee 的指标。
+
+    当 baseline_model 为 None 时回退到旧行为（同一模型四家），
+    返回所有座位的多玩家指标。
+    """
+    env = SelfPlayEnv(model, device=device, deterministic=True,
+                      baseline_model=baseline_model,
+                      trainee_idx=trainee_idx)
+    model.eval()
+    if baseline_model is not None:
+        baseline_model.eval()
+    all_ranks = {p: [] for p in range(4)}
+    all_scores = {p: [] for p in range(4)}
     total_steps = 0
 
     for i in range(num_games):
         traj = env.run_game(seed=10000 + i)
-        wins[traj.winner] += 1
         total_steps += traj.total_steps
 
+        scores = traj.final_scores
+        for p in range(4):
+            rank = sum(1 for q in range(4) if scores[q] > scores[p])
+            all_ranks[p].append(rank)
+            all_scores[p].append(scores[p])
+
+    # 单玩家指标（trainee 视角）
+    trainee_ranks = all_ranks[trainee_idx]
+    trainee_scores = all_scores[trainee_idx]
+    n = num_games
+    fourth_count = sum(1 for r in trainee_ranks if r == 3)
+    first_count = sum(1 for r in trainee_ranks if r == 0)
+
     return {
-        'win_rates': [w / num_games for w in wins],
-        'avg_steps': total_steps / num_games,
+        'win_rate': first_count / n,
+        'avg_rank': sum(trainee_ranks) / n,
+        'avg_score': sum(trainee_scores) / n,
+        'fourth_rate': fourth_count / n,
+        'avg_steps': total_steps / n,
+        'rank_distribution': {
+            str(r): trainee_ranks.count(r) for r in range(4)
+        },
     }
 
 
@@ -118,7 +149,7 @@ def main():
     if use_cuda:
         torch.backends.cudnn.benchmark = True
         print(f"GPU: {torch.cuda.get_device_name(0)} "
-              f"({torch.cuda.get_device_properties(0).total_mem // 1024**2:,} MB VRAM)")
+              f"({torch.cuda.get_device_properties(0).total_memory // 1024**2:,} MB VRAM)")
 
     # 加载训练配置
     train_cfg = load_training_config(args.personality)
@@ -143,6 +174,17 @@ def main():
         model = torch.compile(model, mode='reduce-overhead')
         print("Model compiled with torch.compile")
 
+    # 加载 frozen SL baseline（对手模型，不参与训练）
+    baseline_model = MahjongPolicyValueNet()
+    _, _ = load_checkpoint(baseline_model, args.base_model, device=device)
+    baseline_model = baseline_model.to(device)
+    baseline_model.eval()
+    for p in baseline_model.parameters():
+        p.requires_grad_(False)
+    print(f"Loaded frozen baseline from {args.base_model}")
+
+    trainee_idx = 0  # trainee 固定坐 P0
+
     # 初始化 PPO Agent
     agent = PPOAgent(
         model=model,
@@ -155,15 +197,19 @@ def main():
         value_loss_coef=train_cfg.get('value_loss_coef', 0.5),
         max_grad_norm=train_cfg.get('max_grad_norm', 1.0),
         use_amp=use_cuda and not args.no_amp,
+        kl_coef=train_cfg.get('kl_coef', 0.01),
     )
 
-    # 自对弈环境
-    env = SelfPlayEnv(model, device=device, deterministic=False)
+    # 自对弈环境：trainee 用训练模型 + reward_shaper，对手用 frozen baseline
+    env = SelfPlayEnv(model, device=device, deterministic=False,
+                      reward_shaper=reward_shaper,
+                      trainee_idx=trainee_idx,
+                      baseline_model=baseline_model)
 
     Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
     total_env_steps = 0
     iteration = 0
-    best_eval_win = 0.0
+    best_avg_rank = float('inf')  # lower is better
     history = []
 
     amp_status = "AMP" if (use_cuda and not args.no_amp) else "FP32"
@@ -173,8 +219,9 @@ def main():
     print(f"  PPO epochs: {train_cfg.get('ppo_epochs', 10)}")
     print(f"  Mini-batch size: {train_cfg.get('mini_batch_size', 1024)}")
     print(f"  Reward shaper: {type(reward_shaper).__name__ if reward_shaper else 'base'}")
+    print(f"  Trainee: P{trainee_idx}, Opponents: frozen SL baseline")
     print(f"\n{'Iter':>6} {'Steps':>8} {'PolicyLoss':>12} "
-          f"{'ValueLoss':>10} {'Entropy':>10} {'EvalWR':>8} {'Time':>8}")
+          f"{'ValueLoss':>10} {'Entropy':>10} {'AvgRank':>8} {'4th%':>6} {'Time':>8}")
 
     # ── wandb 初始化 ──
     wandb_run = None
@@ -210,12 +257,6 @@ def main():
             seed = args.seed + iteration * 1000 + g
             traj = env.run_game(seed=seed)
 
-            # 应用奖励塑形
-            if reward_shaper is not None:
-                for step in traj.steps:
-                    step.reward = reward_shaper._last_reward \
-                        if hasattr(reward_shaper, '_last_reward') else step.reward
-
             agent.collect_trajectories([traj])
             total_env_steps += traj.total_steps
 
@@ -227,18 +268,22 @@ def main():
 
         elapsed = time.time() - t0
 
-        # 评估
+        # 评估：trainee vs baseline
         eval_metrics = {}
         if iteration % args.eval_every == 0:
-            eval_metrics = run_eval(model, args.eval_games, device)
+            eval_metrics = run_eval(model, args.eval_games, device,
+                                    baseline_model=baseline_model,
+                                    trainee_idx=trainee_idx)
 
-        win_rate = eval_metrics.get('win_rates', [0.0])[0] if eval_metrics else 0.0
+        avg_rank = eval_metrics.get('avg_rank', float('inf'))
+        fourth_rate = eval_metrics.get('fourth_rate', 0)
 
         print(f"{iteration:>6} {total_env_steps:>8} "
               f"{metrics['policy_loss']:>12.4f} "
               f"{metrics['value_loss']:>10.4f} "
               f"{metrics['entropy']:>10.4f} "
-              f"{win_rate:>8.4f} {elapsed:>7.1f}s")
+              f"{avg_rank:>8.3f} "
+              f"{fourth_rate:>5.0%} {elapsed:>7.1f}s")
 
         if wandb_run is not None:
             log_data = {
@@ -250,8 +295,10 @@ def main():
                 'iteration': iteration,
             }
             if eval_metrics:
-                for i, wr in enumerate(eval_metrics['win_rates']):
-                    log_data[f'eval/win_rate_p{i}'] = wr
+                log_data['eval/avg_rank'] = avg_rank
+                log_data['eval/fourth_rate'] = fourth_rate
+                log_data['eval/win_rate'] = eval_metrics['win_rate']
+                log_data['eval/avg_score'] = eval_metrics['avg_score']
                 log_data['eval/avg_steps'] = eval_metrics['avg_steps']
             wandb.log(log_data, step=total_env_steps)
 
@@ -259,16 +306,19 @@ def main():
             'iteration': iteration,
             'total_steps': total_env_steps,
             **metrics,
-            'eval_win_rate': win_rate,
+            'eval_avg_rank': avg_rank,
+            'eval_fourth_rate': fourth_rate,
         })
 
-        # 保存最佳模型
-        if win_rate > best_eval_win:
-            best_eval_win = win_rate
+        # 保存最佳模型（按 avg_rank，越低越好）
+        if avg_rank < best_avg_rank:
+            best_avg_rank = avg_rank
             agent.save_checkpoint(
                 os.path.join(args.checkpoint_dir, 'rl_best.pt'),
                 iteration,
-                metadata={'eval_win_rate': win_rate, 'personality': args.personality},
+                metadata={'eval_avg_rank': avg_rank,
+                          'eval_fourth_rate': fourth_rate,
+                          'personality': args.personality},
             )
 
         # 定期保存
@@ -287,21 +337,30 @@ def main():
     )
 
     # 最终评估
-    final_eval = run_eval(model, args.eval_games * 2, device)
+    final_eval = run_eval(model, args.eval_games * 2, device,
+                          baseline_model=baseline_model,
+                          trainee_idx=trainee_idx)
     print(f"\nFinal evaluation ({args.eval_games * 2} games):")
-    for i, wr in enumerate(final_eval['win_rates']):
-        print(f"  Player {i}: {wr:.2%}")
+    print(f"  Trainee P{trainee_idx}: WR={final_eval['win_rate']:.1%} "
+          f"AvgRank={final_eval['avg_rank']:.2f} "
+          f"4th={final_eval['fourth_rate']:.0%} "
+          f"AvgScore={final_eval['avg_score']:.0f}")
+    rd = final_eval.get('rank_distribution', {})
+    print(f"  Rank dist: {dict(sorted(rd.items()))}")
     print(f"  Avg steps/game: {final_eval['avg_steps']:.1f}")
-    print(f"  Best eval win rate: {best_eval_win:.4f}")
+    print(f"  Best avg rank: {best_avg_rank:.3f}")
     print(f"Model saved to {args.checkpoint_dir}")
 
     if wandb_run is not None:
-        for i, wr in enumerate(final_eval['win_rates']):
-            wandb.log({f'final/win_rate_p{i}': wr})
-        wandb.log({'final/avg_steps': final_eval['avg_steps'],
-                   'final/best_win_rate': best_eval_win})
+        wandb.log({'final/avg_rank': final_eval['avg_rank'],
+                   'final/fourth_rate': final_eval['fourth_rate'],
+                   'final/win_rate': final_eval['win_rate'],
+                   'final/avg_score': final_eval['avg_score'],
+                   'final/avg_steps': final_eval['avg_steps'],
+                   'final/best_avg_rank': best_avg_rank})
         wandb.finish()
 
 
 if __name__ == '__main__':
     main()
+# 中文注释：强化学习自博弈训练入口，组织环境交互、PPO 更新和 checkpoint 保存。

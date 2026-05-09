@@ -206,3 +206,4 @@ class TestStateTensor:
             tensor = engine.get_state_tensor(p)
             assert tensor is not None
             assert len(tensor.shape) == 1
+# 中文注释：验证游戏引擎主流程，包括初始化、摸切、响应、和牌与流局状态迁移。

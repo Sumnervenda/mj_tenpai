@@ -69,3 +69,4 @@ def test_create_engine_snapshot_shape():
     snapshot = create_engine_snapshot(engine, logs=[{"level": "info", "message": "ok"}])
     assert set(snapshot) == {"state", "rules", "logs"}
     assert snapshot["logs"][0]["message"] == "ok"
+# 中文注释：验证前后端接口契约的序列化、反序列化和字段稳定性。

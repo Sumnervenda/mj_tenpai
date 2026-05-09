@@ -424,3 +424,4 @@ def compute_final_result(
         uma=uma,
         oka=oka,
     )
+# 中文注释：负责符、番、点数和四家付款结算，是和牌结果落分的核心模块。

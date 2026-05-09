@@ -85,3 +85,4 @@ def generate_training_data(num_games: int,
     print(f"Done: {num_games} games, {total_agari} agari, "
           f"{elapsed:.1f}s ({num_games / elapsed:.1f} games/sec)")
     return str(jsonl_path)
+# 中文注释：启发式基线智能体，用于生成样本、做对照实验和快速自测。

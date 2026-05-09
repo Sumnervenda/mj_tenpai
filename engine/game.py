@@ -28,7 +28,7 @@ from .tile import (
     TILE_NAMES, TILE_NUMBERS,
     YAOCHUHAI_TYPES,
 )
-from .wall import Wall, count_dora_in_hand
+from .wall import DRAWABLE_SIZE, Wall, count_dora_in_hand
 from .hand import (
     Hand, Meld, MeldType,
     can_chi, can_pon, can_daiminkan, can_kakan, can_ankan,
@@ -223,14 +223,14 @@ class GameEngine:
         self.wall.reset()
         self.wall.shuffle()
 
-        # 配牌：庄家 14 张，闲家各 13 张
-        # Wall.deal() 返回 (14, 13, 13, 13)；需按 dealer_idx 重排
+        # 配牌：每人 13 张（共 52 张）
+        # Wall.deal() 返回 (13, 13, 13, 13)；需按 dealer_idx 重排
         raw_hands = self.wall.deal()
         hands = [None] * 4
         other_hands = list(raw_hands[1:])  # 三份 13 张
         for p_idx in range(4):
             if p_idx == self.dealer_idx:
-                hands[p_idx] = raw_hands[0]  # 14 张给庄家
+                hands[p_idx] = raw_hands[0]  # 13 张给庄家
             else:
                 hands[p_idx] = other_hands.pop(0)
         for p_idx, tiles in enumerate(hands):
@@ -241,6 +241,12 @@ class GameEngine:
         # 翻开第一张宝牌指示牌（东家第一巡前翻开）
         self.wall.flip_dora()
         self.ura_dora_indicators = []
+
+        # 庄家从可摸牌墙摸第一张牌（此牌由预构建牌山决定，不可更改）
+        first_draw = self.wall.draw()
+        t = abs_to_type(first_draw)
+        self.players[self.dealer_idx].hand.add(t, first_draw)
+        self._last_drawn_tile = t
 
         self.current_player = self.dealer_idx   # 庄家先手
         self.last_discard = -1
@@ -656,7 +662,7 @@ class GameEngine:
         self.current_player = (self.last_discard_by + 1) % 4
 
         # 检查牌山是否耗尽（进入死牌区域之前）
-        if self.wall._live_ptr >= 122:  # 死牌区域起点
+        if self.wall._live_ptr >= self.wall._dead_wall_start:  # 触及王牌区域
             self._handle_ryuukyoku()
             return
 
@@ -1032,7 +1038,7 @@ class GameEngine:
         if player.is_riichi:
             ankan_opts = []
         # 牌山耗尽时禁止槓（无法摸岭上牌）
-        if self.wall._live_ptr >= 122 or not self._has_rinshan_tile():
+        if self.wall._live_ptr >= self.wall._dead_wall_start or not self._has_rinshan_tile():
             ankan_opts = []
 
         kakan_opts = can_kakan(hand, player.hand.melds)
@@ -1164,7 +1170,7 @@ class GameEngine:
             is_riichi=[p.is_riichi for p in self.players],
             last_discard=self.last_discard,
             last_discard_by=self.last_discard_by,
-            remaining_tiles=122 - self.wall._live_ptr,
+            remaining_tiles=self.wall._dead_wall_start - self.wall._live_ptr,
             rewards=rewards or [0.0, 0.0, 0.0, 0.0],
             done=self.is_game_over(),
         )
@@ -1234,7 +1240,7 @@ class GameEngine:
             state.scores[player_idx] / 1000.0,             # 自己分数（千点单位）
             state.honba,                                    # 本场数
             state.riichi_sticks,                            # 场上立直棒数
-            state.remaining_tiles / 122.0,                  # 剩余牌数（归一化）
+            state.remaining_tiles / float(DRAWABLE_SIZE),  # 剩余牌数（归一化）
             1.0 if state.is_riichi[player_idx] else 0.0,   # 自己是否立直
             float(state.round_wind - 27),                   # 场风（0=東, 1=南）
             float(state.round_number),                      # 局数
@@ -1297,3 +1303,4 @@ class GameEngine:
             riichi = " [立直]" if p.is_riichi else ""
             parts.append(f"  P{i}({TILE_NAMES[p.seat_wind]}): {p.score}pts{riichi} {p.hand}")
         return "\n".join(parts)
+# 中文注释：麻将引擎核心状态机，负责发牌、摸切、鸣牌、和牌、流局和结算流程。

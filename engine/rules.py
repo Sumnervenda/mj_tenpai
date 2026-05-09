@@ -73,3 +73,4 @@ class GameConfig:
         if self.east_only:
             return 4   # 東1～東4
         return 8        # 東1～東4 + 南1～南4
+# 中文注释：集中定义游戏规则配置项，便于不同规则集和前端设置复用。

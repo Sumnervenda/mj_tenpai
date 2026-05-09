@@ -286,3 +286,4 @@ def can_ankan(hand_tiles: List[int]) -> List[int]:
 def count_aka_in_list(tile_list: List[int], abs_ids: List[int]) -> int:
     """计算绝对 ID 列表中的赤宝牌数量。"""
     return sum(1 for aid in abs_ids if is_aka(aid))
+# 中文注释：封装玩家手牌、鸣牌、弃牌和手牌增删查等低层数据结构。

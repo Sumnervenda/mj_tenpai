@@ -74,6 +74,9 @@ class MahjongPolicyValueNet(nn.Module):
 
         # 双头
         self.policy_head = nn.Linear(fusion_dim, action_dim)
+        # Value head 使用 Tanh 将输出限制在 [-1, 1]。
+        # 因此 reward 需按分数/10000 归一化，且终端排名奖励控制在 ±1 附近，
+        # 否则 value 网络无法拟合真实 return，GAE advantage 会被污染。
         self.value_head = nn.Sequential(
             nn.Linear(fusion_dim, 128),
             nn.ReLU(inplace=True),
@@ -189,3 +192,4 @@ class MahjongPolicyValueNet(nn.Module):
     def count_parameters(self) -> int:
         """返回可训练参数总数。"""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+# 中文注释：监督学习和强化学习共用的策略-价值网络，输出动作 logits 与局面价值。

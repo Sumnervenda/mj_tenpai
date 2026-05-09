@@ -71,3 +71,4 @@ from .interface import (
     create_engine_snapshot, deserialize_action, serialize_config,
     serialize_game_state, serialize_legal_actions, serialize_tile,
 )
+# 中文注释：引擎包的公共导出入口，外部模块优先从这里导入稳定 API。

@@ -63,3 +63,4 @@ def test_snapshot_hub_pause_state():
     status = hub.status()
     assert status["paused"] is True
     assert status["ok"] is True
+# 中文注释：验证本地控制台/实时接口相关 DTO，确保调试页面能消费引擎状态。

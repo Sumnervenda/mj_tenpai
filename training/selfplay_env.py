@@ -28,7 +28,9 @@ class RolloutStep:
     value: float                   # 状态价值预测
     reward: float                  # 即时奖励
     player_idx: int                # 所属玩家索引 (0-3)
+    game_id: int = 0               # 所属对局 ID（用于 GAE 分组）
     done: bool = False             # 该步后游戏是否结束
+    sl_log_prob: float = 0.0       # SL 冻结策略的对数概率（KL 正则化用）
 
 
 @dataclass
@@ -41,33 +43,56 @@ class GameTrajectory:
 
 
 class SelfPlayEnv:
-    """4 人自对弈环境包装器。
+    """4 人自对弈环境包装器，支持单玩家训练 + 冻结对手。
 
-    同一模型服务所有 4 位玩家。每步收集 (state, mask, action, log_prob, reward, value)。
+    当 baseline_model 为 None 时，同一模型控制四家（旧行为）。
+    当 baseline_model 传入时：trainee_idx 玩家使用 self.model + reward_shaper，
+    其余三家使用 frozen baseline_model，仅收集 trainee 的轨迹数据。
 
     Args:
-        model: 策略-价值双头网络
+        model: 策略-价值双头网络（trainee / 待训练模型）
         device: 推理设备
         deterministic: True 时选最大概率动作（评估），False 时按分布采样（训练）
+        reward_shaper: 奖励塑形器，仅对 trainee 生效
+        trainee_idx: 被训练玩家的座位索引 (0-3)
+        baseline_model: 对手使用的冻结模型，None 表示与 model 相同
     """
 
     def __init__(self,
                  model: MahjongPolicyValueNet,
                  device: str = 'cpu',
-                 deterministic: bool = False):
+                 deterministic: bool = False,
+                 reward_shaper: object = None,
+                 trainee_idx: int = 0,
+                 baseline_model: MahjongPolicyValueNet | None = None,
+                 kl_coef: float = 0.01):
         self.model = model
         self.device = device
         self.deterministic = deterministic
+        self.reward_shaper = reward_shaper
+        self.trainee_idx = trainee_idx
+        self.baseline_model = baseline_model
+        self.kl_coef = kl_coef
+        self._game_id_counter = 0
+
+    def _model_for(self, player_idx: int) -> MahjongPolicyValueNet:
+        """返回指定玩家的推理模型：trainee 用训练模型，对手用 frozen baseline。"""
+        if player_idx == self.trainee_idx:
+            return self.model
+        if self.baseline_model is not None:
+            return self.baseline_model
+        return self.model
 
     @torch.no_grad()
     def _select_action(self, player_idx: int,
-                        engine: GameEngine) -> Tuple[int, float, float]:
+                        engine: GameEngine) -> Tuple[int, float, float, float]:
         """为指定玩家选择动作。
 
         Returns:
             action_idx: 选中的动作索引 (0-76)
             log_prob: 该动作的对数概率
             value: 状态价值
+            sl_log_prob: SL 冻结策略下该动作的对数概率（KL 正则化用）
         """
         state_np = engine.get_state_tensor(player_idx)
         legal = engine.get_legal_actions(player_idx)
@@ -75,14 +100,21 @@ class SelfPlayEnv:
         state_t = torch.from_numpy(state_np).float().to(self.device)
         mask_t = torch.tensor(legal.mask, dtype=torch.float32).to(self.device)
 
-        action_idx, log_prob = self.model.get_action(
+        m = self._model_for(player_idx)
+        action_idx, log_prob = m.get_action(
             state_t, mask_t, deterministic=self.deterministic)
 
-        # 获取价值
-        _, value_t = self.model.forward(state_t, mask_t)
+        _, value_t = m.forward(state_t, mask_t)
         value = value_t.item()
 
-        return action_idx, log_prob.item(), value
+        # KL 正则化：计算 SL 冻结策略下该动作的 log prob
+        sl_log_prob = 0.0
+        if player_idx == self.trainee_idx and self.baseline_model is not None:
+            _, sl_lp = self.baseline_model.get_action(
+                state_t, mask_t, deterministic=True)
+            sl_log_prob = sl_lp.item()
+
+        return action_idx, log_prob.item(), value, sl_log_prob
 
     def _action_from_index(self, action_idx: int, actor: int,
                             legal: LegalActions) -> Action:
@@ -162,16 +194,25 @@ class SelfPlayEnv:
         config = GameConfig()
         engine = GameEngine(config=config, seed=seed)
         trajectory = GameTrajectory()
+        game_id = seed if seed is not None else self._game_id_counter
+        self._game_id_counter += 1
         game_step = 0
         max_steps = 2000
+
+        # 推理时使用 eval 模式：BatchNorm 用 running stats，单样本推理稳定
+        model_was_training = self.model.training
+        bl_was_training = self.baseline_model.training if self.baseline_model else False
+        self.model.eval()
+        if self.baseline_model:
+            self.baseline_model.eval()
 
         while not engine.is_game_over() and game_step < max_steps:
             game_step += 1
 
             if engine.phase == GamePhase.DRAW:
                 p = engine.current_player
+                is_trainee = (p == self.trainee_idx)
 
-                # 收集摸牌前状态
                 state_np = engine.get_state_tensor(p)
                 legal = engine.get_legal_actions(p)
 
@@ -179,64 +220,80 @@ class SelfPlayEnv:
                     engine.step(Action(ActionType.PASS))
                     continue
 
-                action_idx, log_prob, value = self._select_action(p, engine)
+                action_idx, log_prob, value, sl_log_prob = self._select_action(p, engine)
                 action = self._action_from_index(action_idx, p, legal)
 
-                # 确保 action 在合法列表中（模型采样有可能因 mask 失效出界）
                 prev_scores = [pl.score for pl in engine.players]
                 engine.step(action)
-                reward = (engine.players[p].score - prev_scores[p]) / 1000.0
 
-                trajectory.steps.append(RolloutStep(
-                    state=state_np,
-                    mask=np.array(legal.mask, dtype=np.float32),
-                    action=action_idx,
-                    log_prob=log_prob,
-                    value=value,
-                    reward=reward,
-                    player_idx=p,
-                ))
+                # 仅 trainee 使用 reward_shaper，对手用基础分数归一化
+                if is_trainee and self.reward_shaper is not None:
+                    reward = self.reward_shaper(engine, p, action)
+                else:
+                    reward = (engine.players[p].score - prev_scores[p]) / 10000.0
+
+                # 仅收集 trainee 的轨迹数据
+                if is_trainee:
+                    trajectory.steps.append(RolloutStep(
+                        state=state_np,
+                        mask=np.array(legal.mask, dtype=np.float32),
+                        action=action_idx,
+                        log_prob=log_prob,
+                        value=value,
+                        reward=reward,
+                        player_idx=p,
+                        game_id=game_id,
+                        sl_log_prob=sl_log_prob,
+                    ))
 
             elif engine.phase == GamePhase.DISCARD:
-                # 获取所有非舍牌玩家的响应选项
                 options = engine.get_response_options()
 
                 if not options:
                     engine.step(Action(ActionType.PASS))
                     continue
 
-                # 收集各方响应
                 prev_scores = [pl.score for pl in engine.players]
                 responses: Dict[int, Action] = {}
                 for p_idx, legal in options.items():
                     if not legal.actions:
                         continue
 
-                    action_idx, log_prob, value = self._select_action(
+                    is_trainee = (p_idx == self.trainee_idx)
+                    action_idx, log_prob, value, sl_log_prob = self._select_action(
                         p_idx, engine)
                     action = self._action_from_index(action_idx, p_idx, legal)
                     responses[p_idx] = action
 
-                    trajectory.steps.append(RolloutStep(
-                        state=engine.get_state_tensor(p_idx),
-                        mask=np.array(legal.mask, dtype=np.float32),
-                        action=action_idx,
-                        log_prob=log_prob,
-                        value=value,
-                        reward=0.0,  # 响应时 reward 暂记为 0，结算后由引擎统一计算
-                        player_idx=p_idx,
-                    ))
+                    # 仅收集 trainee 的响应步骤
+                    if is_trainee:
+                        trajectory.steps.append(RolloutStep(
+                            state=engine.get_state_tensor(p_idx),
+                            mask=np.array(legal.mask, dtype=np.float32),
+                            action=action_idx,
+                            log_prob=log_prob,
+                            value=value,
+                            reward=0.0,  # 结算后回溯写入
+                            player_idx=p_idx,
+                            game_id=game_id,
+                            sl_log_prob=sl_log_prob,
+                        ))
 
                 engine.resolve_responses(responses)
 
-                # 回溯更新 reward（结算后各玩家分数变动）
-                for p_idx in range(4):
-                    delta = (engine.players[p_idx].score -
-                              prev_scores[p_idx]) / 1000.0
-                    if delta != 0.0:
+                # 回溯写入 reward（仅 trainee 使用 reward_shaper）
+                for p_idx, action in responses.items():
+                    is_trainee = (p_idx == self.trainee_idx)
+                    if is_trainee and self.reward_shaper is not None:
+                        shaped = self.reward_shaper(engine, p_idx, action)
+                    else:
+                        delta = (engine.players[p_idx].score -
+                                 prev_scores[p_idx]) / 10000.0
+                        shaped = delta
+                    if is_trainee and shaped != 0.0:
                         for step in reversed(trajectory.steps):
                             if step.player_idx == p_idx and step.reward == 0.0:
-                                step.reward = delta
+                                step.reward = shaped
                                 break
 
             elif engine.phase in (GamePhase.AGARI, GamePhase.RYUUKYOKU,
@@ -251,6 +308,15 @@ class SelfPlayEnv:
         trajectory.final_scores = list(result.adjusted_scores)
         trajectory.winner = engine.get_winner()
         trajectory.total_steps = game_step
+
+        # 终端惩罚仅来自 reward_shaper（四位惩罚、放铳等），
+        # 不再额外施加排名奖励以保持 reward 信号密度均匀。
+
+        # 恢复模型训练模式
+        if model_was_training:
+            self.model.train()
+        if bl_was_training:
+            self.baseline_model.train()
 
         # 标记最后一步为 done
         if trajectory.steps:
@@ -272,3 +338,4 @@ def run_games(model: MahjongPolicyValueNet,
         traj = env.run_game(seed=seed)
         trajectories.append(traj)
     return trajectories
+# 中文注释：把麻将引擎包装成自博弈环境，向 PPO 提供状态、动作 mask 和奖励。

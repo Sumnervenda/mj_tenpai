@@ -19,7 +19,7 @@ from .game import GameEngine, GameState
 from .hand import Meld, MeldType
 from .rules import GameConfig
 from .tile import NUM_TYPES, TILE_NAMES, TILE_NAMES_CN, abs_to_type, is_aka, type_to_abs
-from .wall import DEAD_WALL_START
+from .wall import DEAD_WALL_SIZE, DRAWABLE_SIZE
 
 
 SEAT_NAMES = ["east", "south", "west", "north"]
@@ -254,8 +254,8 @@ def _serialize_players(engine: GameEngine, state: GameState) -> List[Dict[str, A
 def serialize_game_state(engine: GameEngine) -> Dict[str, Any]:
     """序列化 GameEngine 当前完整状态。"""
     state = engine.get_game_state()
-    live_tiles = engine.wall.tiles[engine.wall._live_ptr:DEAD_WALL_START]
-    dead_wall = engine.wall.tiles[DEAD_WALL_START:]
+    live_tiles = engine.wall.tiles[engine.wall._live_ptr:engine.wall._dead_wall_start]
+    dead_wall = engine.wall.tiles[engine.wall._dead_wall_start:engine.wall._dead_wall_start + DEAD_WALL_SIZE]
 
     return {
         "phase": engine.phase.name,
@@ -309,3 +309,4 @@ def create_engine_snapshot(
         "rules": serialize_config(engine.config),
         "logs": logs or [],
     }
+# 中文注释：把引擎内部对象序列化为前端/API 可消费的数据契约，并反序列化用户动作。

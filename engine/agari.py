@@ -317,3 +317,4 @@ def count_melds_possible(tiles: List[int]) -> int:
     """估算最多能组成的面子数。"""
     total = sum(tiles)
     return total // 3
+# 中文注释：提供和牌、听牌、等待牌等手牌形态判断，是计分与规则判定的基础。

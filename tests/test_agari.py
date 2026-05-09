@@ -247,3 +247,4 @@ class TestLUTCorrectness:
         counts_honor = [3] + [0]*6
         encoded = _encode(counts_honor)
         assert _HONOR_LUT_MELDS[encoded] == True
+# 中文注释：验证和牌、听牌和等待牌判断，覆盖常见牌型与边界场景。

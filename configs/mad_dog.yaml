@@ -7,7 +7,7 @@ reward:
   early_win_bonus: 50.0
   early_win_turn_threshold: 6
 
-training:
+rl_training:
   lr: 3.0e-4
   clip_epsilon: 0.2
   gamma: 0.99
@@ -20,3 +20,4 @@ training:
   ppo_epochs: 10
   mini_batch_size: 1024
   use_amp: true
+# 中文注释：高进攻倾向训练配置，适合测试激进策略参数。

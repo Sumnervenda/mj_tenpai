@@ -1,10 +1,19 @@
-"""牌山（Wall）—— 洗牌、发牌、摸牌、王牌 / 宝牌管理。
+"""牌山（Wall）—— 预构建牌山、发牌、摸牌、王牌 / 宝牌管理。
 
-136 张牌中，最后 14 张为王牌（王牌 = 宝牌指示牌 10 张 + 嶺上牌 4 张）。
+牌山结构（136 张牌，游戏开始前一次性预构建，顺序固定）：
 
-王牌布局（索引 122～135）：
-  122～131：宝牌指示牌（5 组：每组含 1 张表宝牌 + 1 张里宝牌指示牌）
-  132～135：嶺上牌（杠后补充牌，从后往前摸）
+  索引 0～51 （52 张）：4 家初始手牌（各 13 张）
+  索引 52～121（70 张）：可摸牌墙 —— 玩家摸牌区
+  索引 122～135（14 张）：王牌（玩家不可摸）
+
+王牌布局（122～135）：
+  122～131：宝牌指示牌（5 组：每组 1 张表宝牌 + 1 张里宝牌指示牌）
+  132～135：嶺上牌（杠后补充摸牌）
+
+关键设计：
+  - 摸牌顺序完全由预构建决定，玩家操作只影响"谁"摸下一张，不影响"什么牌"
+  - 摸岭上牌后，可摸牌墙末尾一张牌自动补入王牌，维持王牌始终为 14 张
+  - 因此可摸牌数随岭上摸牌递减（初始 70 → 每杠 -1）
 """
 
 import random
@@ -18,13 +27,18 @@ from .tile import (
 # ── 常量 ─────────────────────────────────────────────────────────────────────
 
 TOTAL_TILES = NUM_ABS                     # 136
+TILES_PER_HAND = 13                       # 每人手牌数
+DEAL_SIZE = TILES_PER_HAND * 4            # 52（发牌总数）
 DEAD_WALL_SIZE = 14                       # 王牌数量
-DEAD_WALL_START = TOTAL_TILES - DEAD_WALL_SIZE  # 122（王牌起始位置）
+DRAWABLE_SIZE = TOTAL_TILES - DEAL_SIZE - DEAD_WALL_SIZE  # 70
+
+DRAWABLE_START = DEAL_SIZE                # 52（可摸牌墙起始）
+DEAD_WALL_START = DEAL_SIZE + DRAWABLE_SIZE  # 122（王牌起始位置，初始值）
 RINSHAN_SIZE = 4                          # 嶺上牌数量
 DORA_PAIR_COUNT = 5                       # 5 组表/里宝牌指示牌
 MAX_DORA_INDICATORS = DORA_PAIR_COUNT     # 最多翻 5 次宝牌
 
-# 王牌内部索引
+# 王牌内部固定索引
 DORA_INDICATOR_BASE = DEAD_WALL_START                     # 122
 RINSHAN_BASE = DEAD_WALL_START + 2 * DORA_PAIR_COUNT      # 132
 
@@ -44,10 +58,11 @@ class Wall:
     def __init__(self, seed: Optional[int] = None):
         self.rng = random.Random(seed)                 # 可复现的随机数
         self.tiles: List[int] = []                     # 牌数组（绝对 ID）
-        self._live_ptr: int = 0                        # 牌山摸牌指针
+        self._live_ptr: int = 0                        # 摸牌指针（可摸牌墙位置）
         self._rinshan_ptr: int = 3                     # 嶺上牌指针（从后往前：3,2,1,0）
         self._dora_count: int = 0                      # 已翻宝牌指示牌数量
         self.dora_indicators: List[int] = []           # 已翻开的宝牌指示牌（绝对 ID）
+        self._dead_wall_start: int = DEAD_WALL_START   # 王牌起始位置（可变，岭上牌后递减）
 
         self.reset()
 
@@ -60,6 +75,7 @@ class Wall:
         self._rinshan_ptr = 3
         self._dora_count = 0
         self.dora_indicators = []
+        self._dead_wall_start = DEAD_WALL_START
 
     def shuffle(self) -> None:
         """洗牌：随机打乱牌山顺序。"""
@@ -68,9 +84,10 @@ class Wall:
     # ── 发牌 ──────────────────────────────────────────────────────────────
 
     def deal(self) -> Tuple[List[int], List[int], List[int], List[int]]:
-        """发牌给 4 家。返回 (東家, 南家, 西家, 北家)。
+        """发牌给 4 家。返回 (東家, 南家, 西家, 北家)，各 13 张。
 
-        发牌流程：3 轮每轮每家 4 张 → 每家 13 张 → 东家再摸 1 张（共 14 张）。
+        发牌流程：3 轮每轮每家 4 张 → 每家 13 张（无庄家特权）。
+        庄家的第 14 张将在 _start_round 中从可摸牌墙摸取。
         """
         hands: List[List[int]] = [[] for _ in range(4)]
 
@@ -80,29 +97,32 @@ class Wall:
                 for _ in range(4):
                     hands[p].append(self._take_live())
 
-        # 每家再发 1 张
+        # 每家再发 1 张（共 13 张 / 家）
         for p in range(4):
             hands[p].append(self._take_live())
 
-        # 东家（庄家）额外 1 张
-        hands[0].append(self._take_live())
-
-        return hands[0], hands[1], hands[2], hands[3]
+        return tuple(hands)
 
     # ── 摸牌 ──────────────────────────────────────────────────────────────
 
     def draw(self) -> int:
-        """从牌山摸一张牌。摸尽时抛出 IndexError。"""
-        if self._live_ptr >= DEAD_WALL_START:
+        """从可摸牌墙摸一张牌。摸尽（触及王牌区域）时抛出 IndexError。"""
+        if self._live_ptr >= self._dead_wall_start:
             raise IndexError("牌山已摸尽")
         return self._take_live()
 
     def draw_rinshan(self) -> int:
-        """从嶺上牌摸一张（杠后补充牌）。"""
+        """从嶺上牌摸一张（杠后补充牌）。
+
+        岭上牌从王牌末尾向前摸（135→134→133→132）。
+        摸完后将可摸牌墙末尾一张牌补入王牌，维持王牌始终为 14 张。
+        """
         if self._rinshan_ptr < 0:
             raise IndexError("嶺上牌已摸尽")
         idx = RINSHAN_BASE + self._rinshan_ptr
         self._rinshan_ptr -= 1
+        # 维持王牌数量：将可摸牌墙末尾一张牌并入王牌
+        self._dead_wall_start -= 1
         return self.tiles[idx]
 
     def _take_live(self) -> int:
@@ -192,9 +212,10 @@ def count_dora_in_hand(hand_types: List[int],
 
 def lives_remaining(wall: Wall) -> int:
     """牌山中剩余的可摸牌数量（不含王牌）。"""
-    return DEAD_WALL_START - wall._live_ptr
+    return wall._dead_wall_start - wall._live_ptr
 
 
 def is_last_tile(wall: Wall) -> bool:
     """判断下一张是否为海底牌（牌山最后一张）。"""
-    return wall._live_ptr == DEAD_WALL_START - 1
+    return wall._live_ptr == wall._dead_wall_start - 1
+# 中文注释：实现牌山、王牌、宝牌指示牌、发牌和摸牌等牌堆行为。

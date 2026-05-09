@@ -53,3 +53,4 @@ def load_checkpoint(model: torch.nn.Module,
     epoch = checkpoint.get('epoch', 0)
     metadata = checkpoint.get('metadata', {})
     return epoch, metadata
+# 中文注释：模型 checkpoint 的保存与加载工具，统一处理权重、优化器和元数据。

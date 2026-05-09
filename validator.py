@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 中文注释：Agari 计分验证脚本，用历史牌谱抽样对比本项目和外部 agari 程序的结果。
 """
 Agari Validator - Validates the Agari scoring engine against Tenhou historical data.
 

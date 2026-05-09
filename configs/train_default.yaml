@@ -39,3 +39,4 @@ wandb:
   enabled: false
   project: mahjong-dl
   entity: null
+# 中文注释：默认训练配置，集中记录监督学习/强化学习共享的基础超参数。

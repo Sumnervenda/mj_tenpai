@@ -808,3 +808,4 @@ def _kokushi_waits(tiles: List[int]) -> List[int]:
         if tiles[t] == 1:
             waits.append(t)
     return waits
+# 中文注释：检测立直麻将役种与部分符计算辅助逻辑，为 scoring 模块提供役种结果。

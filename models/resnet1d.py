@@ -70,3 +70,4 @@ class ResNet1DBackbone(nn.Module):
         x = self.res_blocks(x)
         x = self.global_pool(x).squeeze(-1)
         return x
+# 中文注释：一维残差网络骨干，用于在 34 种牌型维度上提取局面特征。

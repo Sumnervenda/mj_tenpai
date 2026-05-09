@@ -34,6 +34,8 @@ class RolloutBuffer:
     values: List[float] = field(default_factory=list)
     dones: List[bool] = field(default_factory=list)
     player_indices: List[int] = field(default_factory=list)
+    game_ids: List[int] = field(default_factory=list)
+    sl_log_probs: List[float] = field(default_factory=list)
 
     def add_step(self, step: RolloutStep) -> None:
         self.states.append(step.state)
@@ -44,6 +46,8 @@ class RolloutBuffer:
         self.values.append(step.value)
         self.dones.append(step.done)
         self.player_indices.append(step.player_idx)
+        self.game_ids.append(step.game_id)
+        self.sl_log_probs.append(step.sl_log_prob)
 
     def extend_trajectory(self, traj: GameTrajectory) -> None:
         for step in traj.steps:
@@ -58,6 +62,8 @@ class RolloutBuffer:
         self.values.clear()
         self.dones.clear()
         self.player_indices.clear()
+        self.game_ids.clear()
+        self.sl_log_probs.clear()
 
     def __len__(self) -> int:
         return len(self.states)
@@ -73,6 +79,7 @@ class RolloutBuffer:
             torch.tensor(self.rewards, dtype=torch.float32).to(device),
             torch.tensor(self.values, dtype=torch.float32).to(device),
             torch.tensor(self.dones, dtype=torch.float32).to(device),
+            torch.tensor(self.sl_log_probs, dtype=torch.float32).to(device),
         )
 
 
@@ -117,6 +124,54 @@ def compute_gae(rewards: torch.Tensor,
     return returns, advantages
 
 
+def compute_gae_grouped(rewards: torch.Tensor,
+                        values: torch.Tensor,
+                        dones: torch.Tensor,
+                        game_ids: list,
+                        player_indices: list,
+                        gamma: float = 0.99,
+                        gae_lambda: float = 0.95
+                        ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """按 (game_id, player_idx) 分组计算 GAE，避免跨玩家 value 混合。
+
+    日麻自对弈中四家交错行动（P0, P1, P2, P3, P0...），
+    不同玩家的 value 不应互相关联。此函数为每个玩家独立计算 GAE。
+
+    Args:
+        rewards: (T,) 即时奖励
+        values: (T,) 状态价值
+        dones: (T,) 终局标记
+        game_ids: [int] 每个 step 所属 game_id
+        player_indices: [int] 每个 step 所属 player_idx
+        gamma: 折扣因子
+        gae_lambda: GAE λ
+
+    Returns:
+        returns: (T,) 折扣回报
+        advantages: (T,) GAE 优势
+    """
+    returns = torch.zeros_like(rewards)
+    advantages = torch.zeros_like(rewards)
+
+    groups: dict = {}
+    for i, (gid, pid) in enumerate(zip(game_ids, player_indices)):
+        key = (gid, pid)
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(i)
+
+    for indices in groups.values():
+        idx_tensor = torch.tensor(indices, device=rewards.device)
+        sub_ret, sub_adv = compute_gae(
+            rewards[idx_tensor], values[idx_tensor], dones[idx_tensor],
+            gamma=gamma, gae_lambda=gae_lambda,
+        )
+        returns[idx_tensor] = sub_ret
+        advantages[idx_tensor] = sub_adv
+
+    return returns, advantages
+
+
 class PPOAgent:
     """PPO 训练 Agent。
 
@@ -143,7 +198,8 @@ class PPOAgent:
                  entropy_coef: float = 0.01,
                  value_loss_coef: float = 0.5,
                  max_grad_norm: float = 1.0,
-                 use_amp: bool = True):
+                 use_amp: bool = True,
+                 kl_coef: float = 0.01):
         self.model = model.to(device)
         self.device = device
         self.clip_epsilon = clip_epsilon
@@ -153,6 +209,7 @@ class PPOAgent:
         self.value_loss_coef = value_loss_coef
         self.max_grad_norm = max_grad_norm
         self.use_amp = use_amp and device == 'cuda'
+        self.kl_coef = kl_coef
 
         self.optimizer = AdamW(model.parameters(), lr=lr)
         self.scaler = GradScaler('cuda', enabled=self.use_amp)
@@ -181,12 +238,15 @@ class PPOAgent:
             return {'policy_loss': 0.0, 'value_loss': 0.0,
                     'entropy': 0.0, 'total_loss': 0.0}
 
-        states, masks, actions, old_log_probs, rewards, values, dones = \
+        self.model.train()  # PPO 更新需要 BatchNorm 在 train 模式
+
+        states, masks, actions, old_log_probs, rewards, values, dones, sl_log_probs = \
             self.buffer.to_tensors(self.device)
 
-        # GAE
-        returns, advantages = compute_gae(
+        # GAE — 按 (game_id, player_idx) 分组，避免跨玩家 value 混合
+        returns, advantages = compute_gae_grouped(
             rewards, values, dones,
+            self.buffer.game_ids, self.buffer.player_indices,
             gamma=self.gamma, gae_lambda=self.gae_lambda,
         )
 
@@ -208,6 +268,7 @@ class PPOAgent:
                 m_batch = masks[batch_idx]
                 a_batch = actions[batch_idx]
                 old_lp_batch = old_log_probs[batch_idx]
+                sl_lp_batch = sl_log_probs[batch_idx]
                 adv_batch = advantages[batch_idx]
                 ret_batch = returns[batch_idx]
 
@@ -230,10 +291,14 @@ class PPOAgent:
                     # Entropy bonus
                     entropy_mean = entropy.mean()
 
+                    # KL 散度正则化：防止策略偏离 SL 预训练太远
+                    kl_loss = (new_log_probs - sl_lp_batch).mean()
+
                     # Total loss
                     total_loss = (policy_loss +
                                   self.value_loss_coef * value_loss -
-                                  self.entropy_coef * entropy_mean)
+                                  self.entropy_coef * entropy_mean +
+                                  self.kl_coef * kl_loss)
 
                 if self.use_amp:
                     self.scaler.scale(total_loss).backward()
@@ -272,3 +337,4 @@ class PPOAgent:
         return load_checkpoint(self.model, path,
                                optimizer=self.optimizer,
                                device=self.device)
+# 中文注释：PPO 强化学习智能体，负责采样动作、缓存轨迹并执行策略更新。

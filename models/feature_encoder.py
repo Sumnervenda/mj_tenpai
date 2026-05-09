@@ -38,3 +38,4 @@ class StateFeatureEncoder:
         """反向操作：将空间+元数据拼回 354 维平铺向量（用于数据增强等场景）。"""
         flat_spatial = states.reshape(*states.shape[:-2], 340)
         return torch.cat([flat_spatial, metadata], dim=-1)
+# 中文注释：把 354 维状态向量拆成牌面空间特征和元数据特征，供模型双路编码。

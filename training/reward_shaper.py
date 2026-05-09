@@ -25,20 +25,30 @@ class RewardShaper:
             归一化奖励值
         """
         state = engine.get_game_state()
-        return state.rewards[player_idx] / 1000.0
+        return state.rewards[player_idx] / 10000.0
 
 
 class TurtleShaper(RewardShaper):
-    """千年老龟：极度避四防守型。
+    """千年老龟：强手进攻、弱手死守型。
 
-    惩罚放铳和第四名，迫使 AI 学会弃和和安全牌策略。
+    手牌 4 番以上时鼓励和牌（高打点奖励），手牌差时惩罚放铳和第四名，
+    迫使 AI 学会弃和和安全牌策略。
+
+    中间奖励（增加信号密度，避免稀疏奖励导致策略退化）：
+      - 立直 +riichi_bonus/10000（乌龟也能立直，尤其在好牌时）
     """
 
     def __init__(self,
                  fourth_place_penalty: float = -200.0,
-                 dealing_in_penalty: float = -50.0):
+                 dealing_in_penalty: float = -50.0,
+                 high_value_bonus: float = 200.0,
+                 high_value_threshold: int = 4,
+                 riichi_bonus: float = 100.0):
         self.fourth_place_penalty = fourth_place_penalty
         self.dealing_in_penalty = dealing_in_penalty
+        self.high_value_bonus = high_value_bonus
+        self.high_value_threshold = high_value_threshold
+        self.riichi_bonus = riichi_bonus
 
     def __call__(self, engine: GameEngine, player_idx: int,
                  action: Optional[Action] = None) -> float:
@@ -48,13 +58,25 @@ class TurtleShaper(RewardShaper):
         payments = getattr(engine, '_last_agari_payments', [])
         for p in payments:
             if p.loser == player_idx:
-                reward += self.dealing_in_penalty / 1000.0
+                reward += self.dealing_in_penalty / 10000.0
+
+        # 和牌奖励：4 番以上额外加分
+        if action is not None and action.action_type in (ActionType.TSUMO,
+                                                          ActionType.RON):
+            for p in payments:
+                if p.winner == player_idx and p.han >= self.high_value_threshold:
+                    reward += self.high_value_bonus / 10000.0
+                    break
+
+        # 立直中间奖励
+        if action is not None and action.action_type == ActionType.RIICHI:
+            reward += self.riichi_bonus / 10000.0
 
         # 第四名惩罚
         if engine.is_game_over():
             result = engine.get_result()
-            if result.ranks[player_idx] == 3:  # 0-indexed，3 = 第4位
-                reward += self.fourth_place_penalty / 1000.0
+            if result.ranks[player_idx] == 3:
+                reward += self.fourth_place_penalty / 10000.0
 
         return reward
 
@@ -81,14 +103,14 @@ class MadDogShaper(RewardShaper):
         if engine.is_game_over():
             result = engine.get_result()
             if result.ranks[player_idx] == 0:  # 0-indexed，0 = 第1位
-                reward += self.first_place_bonus / 1000.0
+                reward += self.first_place_bonus / 10000.0
 
         # 早巡胡牌奖励（通过检查 action 判断）
         if action is not None and action.action_type in (ActionType.TSUMO,
                                                           ActionType.RON):
             player = engine.players[player_idx]
             if len(player.discards) <= self.early_win_turn_threshold:
-                reward += self.early_win_bonus / 1000.0
+                reward += self.early_win_bonus / 10000.0
 
         return reward
 
@@ -136,6 +158,9 @@ def load_shaper_from_config(config_path: str) -> RewardShaper:
         return TurtleShaper(
             fourth_place_penalty=reward_cfg.get('fourth_place_penalty', -200.0),
             dealing_in_penalty=reward_cfg.get('dealing_in_penalty', -50.0),
+            high_value_bonus=reward_cfg.get('high_value_bonus', 200.0),
+            high_value_threshold=reward_cfg.get('high_value_threshold', 4),
+            riichi_bonus=reward_cfg.get('riichi_bonus', 100.0),
         )
     elif personality == 'mad_dog':
         return MadDogShaper(
@@ -150,3 +175,4 @@ def load_shaper_from_config(config_path: str) -> RewardShaper:
         )
     else:
         return RewardShaper()
+# 中文注释：奖励塑形模块，把牌局事件转换为更密集的强化学习训练信号。
