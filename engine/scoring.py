@@ -14,8 +14,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from .tile import (
-    NUM_TYPES, YAOCHUHAI_TYPES, ROTOHAI_TYPES,
-    is_jihai, is_kazehai, is_sangenhai, is_yaochuhai,
+    is_kazehai, is_sangenhai, is_yaochuhai,
 )
 from .hand import Meld, MeldType
 

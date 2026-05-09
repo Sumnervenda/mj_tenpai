@@ -195,18 +195,16 @@ def _dora_type(indicator_abs: int) -> int:
 
 
 def count_dora_in_hand(hand_types: List[int],
-                       dora_types: List[int],
-                       aka_types: Optional[List[int]] = None) -> int:
+                       dora_types: List[int]) -> int:
     """计算手牌中的宝牌数量。
 
-    每张匹配宝牌类型的牌 +1 宝，赤宝牌额外 +1（不依赖指示牌）。
+    每张匹配宝牌类型的牌 +1 宝。
+    赤宝牌由调用方通过 len(player.hand.aka_tiles) 单独计算。
     """
     count = 0
     for t in hand_types:
         if t in dora_types:
             count += 1
-    if aka_types:
-        count += sum(1 for t in aka_types if t in AKA_TYPES)
     return count
 
 

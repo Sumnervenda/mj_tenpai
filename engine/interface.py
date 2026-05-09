@@ -18,8 +18,8 @@ from .agari import get_waits, is_tenpai
 from .game import GameEngine, GameState
 from .hand import Meld, MeldType
 from .rules import GameConfig
-from .tile import NUM_TYPES, TILE_NAMES, TILE_NAMES_CN, abs_to_type, is_aka, type_to_abs
-from .wall import DEAD_WALL_SIZE, DRAWABLE_SIZE
+from .tile import TILE_NAMES, TILE_NAMES_CN, abs_to_type, is_aka
+from .wall import DEAD_WALL_SIZE
 
 
 SEAT_NAMES = ["east", "south", "west", "north"]
@@ -242,7 +242,8 @@ def _serialize_players(engine: GameEngine, state: GameState) -> List[Dict[str, A
             "has_won": player.has_won,
             "tenpai": bool(waits),
             "waits": waits,
-            "furiten": bool(player.furiten_types or player.temp_furiten or player.is_riichi_furiten),
+            "furiten": bool(player.temp_furiten or player.is_riichi_furiten
+                           or any(dt in waits for dt in player.discard_types)),
             "is_tenpai_at_ryuukyoku": player.is_tenpai_at_ryuukyoku,
             "legal_actions": serialize_legal_actions(
                 state.legal_actions if index == state.current_player else None

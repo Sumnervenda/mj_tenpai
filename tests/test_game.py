@@ -333,5 +333,121 @@ class TestRyanhanShibari:
         engine._handle_tsumo(engine.dealer_idx)
         assert p.has_won, "Player should be marked as won with 2 han"
         assert engine.phase == GamePhase.AGARI
+class TestChantaHonroutouStacking:
+    """Item 2: Chanta and Honroutou should stack (both awarded)."""
+
+    def test_chanta_honroutou_stacking(self):
+        """Hand with all terminals/honors gets both Chanta and Honroutou."""
+        from engine.yaku import YakuChecker, WinContext, Yaku
+
+        # Open PON 111m + concealed: 999m, EEE, 333p, 99s
+        # Open meld prevents Suuankou yakuman from overriding regular yaku.
+        tiles = [0] * 34
+        tiles[8] = 3   # 999m
+        tiles[12] = 3  # 333p (actually 4p=12... wait)
+        tiles[27] = 3  # EEE
+        tiles[26] = 2  # 99s (pair)
+
+        # Use 111m as open PON (tile 0 = 1m)
+        # All concealed tiles must be yaochuhai too
+        tiles = [0] * 34
+        tiles[8] = 3   # 999m (terminal)
+        tiles[9] = 3   # 111p (terminal)
+        tiles[27] = 3  # EEE (honor)
+        tiles[26] = 2  # 99s (terminal)
+
+        ctx = WinContext(
+            is_menzen=False, is_tsumo=True,
+            concealed_tiles=tiles,
+            open_melds=[Meld(MeldType.PON, [0, 0, 0],
+                             called_from=2, source_tile=0)],
+            bakaze=27, jikaze=27,
+            winning_tile=26,
+        )
+        checker = YakuChecker(ctx)
+        result = checker.check_all()
+
+        yaku_ids = {y for y, _ in result.yaku_list}
+        assert not result.is_yakuman, "Should not be yakuman"
+        assert Yaku.CHANTA in yaku_ids, "Chanta should be present"
+        assert Yaku.HONROUTOU in yaku_ids, "Honroutou should be present"
+
+    def test_chanta_without_honroutou(self):
+        """Chanta awarded when some middle tiles present (not all yaochuhai)."""
+        from engine.yaku import YakuChecker, WinContext, Yaku
+
+        # 123m 789m 123p EEE + 99s — chanta (each meld has terminal/honor)
+        tiles = [0] * 34
+        tiles[0] = 1   # 1m
+        tiles[1] = 1   # 2m (middle tile — blocks Honroutou)
+        tiles[2] = 1   # 3m
+        tiles[6] = 1   # 7m
+        tiles[7] = 1   # 8m
+        tiles[8] = 1   # 9m
+        tiles[9] = 1   # 1p
+        tiles[10] = 1  # 2p (middle tile — blocks Honroutou)
+        tiles[11] = 1  # 3p
+        tiles[27] = 3  # EEE
+        tiles[26] = 2  # 99s (pair)
+
+        ctx = WinContext(
+            is_menzen=True, is_tsumo=True,
+            concealed_tiles=tiles,
+            bakaze=27, jikaze=27,
+            winning_tile=26,
+        )
+        checker = YakuChecker(ctx)
+        result = checker.check_all()
+
+        yaku_ids = {y for y, _ in result.yaku_list}
+        assert Yaku.CHANTA in yaku_ids, "Chanta should be present"
+        assert Yaku.HONROUTOU not in yaku_ids, (
+            "Honroutou should NOT be present (hand has middle tiles)")
+
+
+class TestDecomposeShuntsuPreference:
+    """Item 1: decompose_hand should prefer shuntsu over koutsu."""
+
+    def test_pure_shuntsu_hand(self):
+        """A pure all-shuntsu hand decomposes with 4 shuntsu."""
+        from engine.yaku import decompose_hand
+
+        # 123m 345m 456m 789m + 22p (pair)
+        tiles = [0] * 34
+        tiles[0] = 1   # 1m
+        tiles[1] = 1   # 2m
+        tiles[2] = 2   # 3m (used in 123 and 345)
+        tiles[3] = 2   # 4m (used in 345 and 456)
+        tiles[4] = 2   # 5m (used in 345 and 456)
+        tiles[5] = 1   # 6m
+        tiles[6] = 1   # 7m
+        tiles[7] = 1   # 8m
+        tiles[8] = 1   # 9m
+        tiles[10] = 2  # 2p (pair)
+
+        decomp = decompose_hand(tiles)
+        assert decomp is not None, "Should find a decomposition"
+        shuntsu_count = sum(1 for m in decomp.melds if m[0] == 'shuntsu')
+        assert shuntsu_count == 4, f"Expected 4 shuntsu, got {shuntsu_count}"
+
+    def test_ambiguous_hand_prefers_max_shuntsu(self):
+        """Hand ambiguous between koutsu and shuntsu → prefer max shuntsu."""
+        from engine.yaku import decompose_hand
+
+        # 222333444555m + 66m (pair)
+        # Shuntsu-max: 234,234,345,456 + 66 = 4 shuntsu, 0 koutsu
+        # Koutsu-max: 222,333,444,555 + 66 = 4 koutsu
+        tiles = [0] * 34
+        for t in [1, 2, 3, 4]:  # 2m, 3m, 4m, 5m
+            tiles[t] = 3
+        tiles[5] = 2  # 6m (pair)
+
+        decomp = decompose_hand(tiles)
+        assert decomp is not None, "Should find a decomposition"
+        shuntsu_count = sum(1 for m in decomp.melds if m[0] == 'shuntsu')
+        koutsu_count = sum(1 for m in decomp.melds if m[0] == 'koutsu')
+        assert shuntsu_count >= 2, (
+            f"Should prefer shuntsu, got {shuntsu_count} shuntsu, {koutsu_count} koutsu")
+        assert koutsu_count < 4, "Should not be all-koutsu"
 # 中文注释：验证游戏引擎主流程，包括初始化、摸切、响应、和牌与流局状态迁移。
 

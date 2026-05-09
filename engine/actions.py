@@ -18,11 +18,10 @@
 
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from .tile import NUM_TYPES
 from .hand import (
-    Hand, Meld, MeldType,
     can_chi, can_pon, can_daiminkan, can_kakan, can_ankan,
 )
 

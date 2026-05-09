@@ -25,10 +25,11 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from .tile import (
     NUM_TYPES, TANYAO_TYPES, YAOCHUHAI_TYPES, ROTOHAI_TYPES,
-    GREEN_TYPES, JIHAI_TYPES, KAZEHAI, SANGENHAI,
+    GREEN_TYPES, JIHAI_TYPES,
     is_jihai, is_kazehai, is_sangenhai, is_shupai, is_yaochuhai,
-    TILE_NUMBERS, TILE_NAMES,
+    TILE_NUMBERS,
 )
+from .agari import _is_kokushi, _is_chiitoitsu
 from .hand import Meld, MeldType
 
 
@@ -142,63 +143,129 @@ class HandDecomposition:
 def decompose_hand(tiles: List[int]) -> Optional[HandDecomposition]:
     """将已胡牌的门内手牌分解为 4 面子 + 1 雀头。
 
-    使用递归回溯法寻找一种合法分解（仅找第一种）。
+    穷举所有合法分解，返回顺子数最多（刻子数最少）的分解，
+    以最大化平和、一盃口等顺子系役种的检测率。
     前提：tiles 已经 is_agari 验证，不会返回 None。
+    """
+    counts = list(tiles)
+    best_melds = None
+    best_pair = None
+    best_shuntsu = -1
+
+    def _find_first(c: List[int]) -> Optional[int]:
+        for i in range(NUM_TYPES):
+            if c[i] > 0:
+                return i
+        return None
+
+    def _solve(c: List[int], need_pair: bool,
+               melds: list, pair: Optional[tuple]) -> None:
+        nonlocal best_melds, best_pair, best_shuntsu
+        first = _find_first(c)
+        if first is None:
+            if not need_pair:
+                shuntsu_count = sum(1 for m in melds if m[0] == 'shuntsu')
+                if shuntsu_count > best_shuntsu:
+                    best_melds = list(melds)
+                    best_pair = pair
+                    best_shuntsu = shuntsu_count
+            return
+
+        cnt = c[first]
+
+        # 尝试取雀头
+        if need_pair and cnt >= 2:
+            c[first] -= 2
+            _solve(c, False, melds, (first, first))
+            c[first] += 2
+
+        # 尝试取刻子
+        if cnt >= 3:
+            c[first] -= 3
+            melds.append(('koutsu', [first, first, first]))
+            _solve(c, need_pair, melds, pair)
+            melds.pop()
+            c[first] += 3
+
+        # 尝试取顺子
+        if is_shupai(first) and (first % 9) <= 6:
+            if c[first + 1] > 0 and c[first + 2] > 0:
+                c[first] -= 1
+                c[first + 1] -= 1
+                c[first + 2] -= 1
+                melds.append(('shuntsu', [first, first + 1, first + 2]))
+                _solve(c, need_pair, melds, pair)
+                melds.pop()
+                c[first] += 1
+                c[first + 1] += 1
+                c[first + 2] += 1
+
+    _solve(counts, True, [], None)
+
+    if best_melds is not None:
+        return HandDecomposition(
+            melds=best_melds, pair=best_pair or (-1, -1), waits=[])
+    return None
+
+
+def _decompose_koutsu_first(tiles: List[int]) -> Optional[HandDecomposition]:
+    """刻子优先的手牌分解，供対々和/三暗刻等刻子系役种独立使用。
+
+    与旧版 decompose_hand 逻辑一致：递归回溯，先试刻子再试顺子，
+    返回第一个合法分解。
     """
     melds = []
     pair = None
     counts = list(tiles)
 
-    def _find_first(counts: List[int]) -> Optional[int]:
+    def _find_first(c: List[int]) -> Optional[int]:
         for i in range(NUM_TYPES):
-            if counts[i] > 0:
+            if c[i] > 0:
                 return i
         return None
 
-    def _solve(counts: List[int], need_pair: bool) -> bool:
+    def _solve(c: List[int], need_pair: bool) -> bool:
         nonlocal melds, pair
-        first = _find_first(counts)
+        first = _find_first(c)
         if first is None:
-            return not need_pair  # 全部清空 → 成功
+            return not need_pair
 
-        c = counts[first]
+        cnt = c[first]
 
-        # 尝试在此位置取雀头
-        if need_pair and c >= 2:
-            counts[first] -= 2
+        if need_pair and cnt >= 2:
+            c[first] -= 2
             pair = (first, first)
-            if _solve(counts, False):
+            if _solve(c, False):
                 return True
-            counts[first] += 2
+            c[first] += 2
             pair = None
 
-        # 尝试取刻子
-        if c >= 3:
-            counts[first] -= 3
+        if cnt >= 3:
+            c[first] -= 3
             melds.append(('koutsu', [first, first, first]))
-            if _solve(counts, need_pair):
+            if _solve(c, need_pair):
                 return True
             melds.pop()
-            counts[first] += 3
+            c[first] += 3
 
-        # 尝试取顺子（数牌且当前位置 ≤ 同花色第 7 位）
         if is_shupai(first) and (first % 9) <= 6:
-            if counts[first + 1] > 0 and counts[first + 2] > 0:
-                counts[first] -= 1
-                counts[first + 1] -= 1
-                counts[first + 2] -= 1
+            if c[first + 1] > 0 and c[first + 2] > 0:
+                c[first] -= 1
+                c[first + 1] -= 1
+                c[first + 2] -= 1
                 melds.append(('shuntsu', [first, first + 1, first + 2]))
-                if _solve(counts, need_pair):
+                if _solve(c, need_pair):
                     return True
                 melds.pop()
-                counts[first] += 1
-                counts[first + 1] += 1
-                counts[first + 2] += 1
+                c[first] += 1
+                c[first + 1] += 1
+                c[first + 2] += 1
 
         return False
 
     if _solve(counts, True):
-        return HandDecomposition(melds=list(melds), pair=pair or (-1, -1), waits=[])
+        return HandDecomposition(
+            melds=list(melds), pair=pair or (-1, -1), waits=[])
     return None
 
 
@@ -517,8 +584,6 @@ class YakuChecker:
                 return False
         if not is_yaochuhai(self.decomp.pair[0]):
             return False
-        if all(is_yaochuhai(t) for t in range(NUM_TYPES) if self.all_tiles[t] > 0):
-            return False  # 排除混老頭（応算混老头而非混全带）
         return True
 
     def _check_ittsuu(self) -> bool:
@@ -557,21 +622,30 @@ class YakuChecker:
         return False
 
     def _check_toitoi(self) -> bool:
-        """対々和：全部 4 组面子为刻子 + 1 对雀头（含副露）。"""
-        if not self.decomp:
-            return False
-        return all(m[0] in ('koutsu',) for m in self.all_melds)
+        """対々和：全部 4 组面子为刻子 + 1 对雀头（含副露）。
+
+        使用独立的刻子优先分解，不依赖主（顺子优先）分解。
+        """
+        # 副露中不可有吃
+        for meld in self.ctx.open_melds:
+            if meld.meld_type == MeldType.CHI:
+                return False
+        # 门内牌可用刻子优先分解
+        return _decompose_koutsu_first(list(self.ctx.concealed_tiles)) is not None
 
     def _check_sanankou(self) -> bool:
-        """三暗刻：3 组门内刻子（含暗槓）。"""
-        if not self.decomp:
-            return False
+        """三暗刻：3 组门内刻子（含暗槓）。
+
+        使用独立的刻子优先分解以最大化暗刻计数。
+        """
         closed_koutsu = 0
-        for mtype, tiles in self.decomp.melds:
-            if mtype == 'koutsu':
-                if not self.ctx.is_tsumo and self.ctx.winning_tile in tiles:
-                    continue  # 荣和完成的刻子不算暗刻
-                closed_koutsu += 1
+        koutsu_decomp = _decompose_koutsu_first(list(self.ctx.concealed_tiles))
+        if koutsu_decomp:
+            for mtype, tiles in koutsu_decomp.melds:
+                if mtype == 'koutsu':
+                    if not self.ctx.is_tsumo and self.ctx.winning_tile in tiles:
+                        continue  # 荣和完成的刻子不算暗刻
+                    closed_koutsu += 1
         for meld in self.ctx.open_melds:
             if meld.meld_type == MeldType.KAN_CLOSED:
                 closed_koutsu += 1
@@ -774,30 +848,6 @@ def _is_yakuhai_pair(tile_type: int, bakaze: int, jikaze: int) -> bool:
     if is_sangenhai(tile_type):
         return True
     return False
-
-
-def _is_kokushi(tiles: List[int]) -> bool:
-    """国士無双判定：13 种幺九牌各 1 张 + 1 种为对子。"""
-    yaochu = list(YAOCHUHAI_TYPES)
-    pair_count = 0
-    for t in yaochu:
-        c = tiles[t]
-        if c == 0:      return False
-        if c == 2:      pair_count += 1
-        elif c > 2:     return False
-    for t in range(NUM_TYPES):
-        if t not in YAOCHUHAI_TYPES and tiles[t] > 0:
-            return False
-    return pair_count == 1
-
-
-def _is_chiitoitsu(tiles: List[int]) -> bool:
-    """七対子判定：7 种牌各 2 张。"""
-    pairs = 0
-    for c in tiles:
-        if c == 2:      pairs += 1
-        elif c != 0:    return False
-    return pairs == 7
 
 
 def _kokushi_waits(tiles: List[int]) -> List[int]:

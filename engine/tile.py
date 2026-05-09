@@ -95,9 +95,6 @@ def is_shupai(t: int) -> bool: return 0 <= t <= 26     # 是否为数牌（万/�
 def is_yaochuhai(t: int) -> bool:
     """是否为幺九牌（1/9 数牌 或 字牌）。"""
     return t in {0, 8, 9, 17, 18, 26} or is_jihai(t)
-def is_tsupai(t: int) -> bool: return is_jihai(t)      # 字牌的别称
-
-
 # ── 绝对 ID ↔ 类型 ID 转换 ──────────────────────────────────────────────────
 
 def abs_to_type(abs_id: int) -> int:

@@ -12,11 +12,11 @@
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import List, Optional, Set, Tuple
+from typing import List
 
 from .tile import (
     NUM_TYPES, MANZU, PINZU, SOUZU, JIHAI,
-    abs_to_type, is_aka, is_jihai, YAOCHUHAI_TYPES,
+    is_aka, is_jihai,
 )
 
 

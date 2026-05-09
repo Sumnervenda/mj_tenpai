@@ -12,23 +12,19 @@
 
 from __future__ import annotations
 
-import math
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 
 import numpy as np
 
 from .tile import (
-    NUM_TYPES, NUM_ABS,
-    MANZU, PINZU, SOUZU, JIHAI,
-    abs_to_type, type_to_abs, is_aka, is_aka_type,
-    is_jihai, is_shupai, is_yaochuhai,
-    TILE_NAMES, TILE_NUMBERS,
-    YAOCHUHAI_TYPES,
+    NUM_TYPES,
+    abs_to_type, type_to_abs, is_aka,
+    TILE_NAMES,
 )
-from .wall import DRAWABLE_SIZE, Wall, count_dora_in_hand
+from .wall import Wall, count_dora_in_hand, DRAWABLE_SIZE
 from .hand import (
     Hand, Meld, MeldType,
     can_chi, can_pon, can_daiminkan, can_kakan, can_ankan,
@@ -39,7 +35,8 @@ from .agari import (
 )
 from .yaku import (
     YakuChecker, WinContext, YakuResult,
-    _is_kokushi, _is_chiitoitsu, Yaku, YAKU_NAMES_JP,
+    _is_chiitoitsu, Yaku, YAKU_NAMES_JP,
+    decompose_hand,
 )
 from .scoring import (
     calculate_fu_from_decomp, compute_payments, compute_final_result,
@@ -48,7 +45,6 @@ from .scoring import (
 from .actions import (
     Action, ActionType, LegalActions,
     compute_draw_actions, compute_response_actions,
-    MAX_ACTIONS,
 )
 from .rules import GameConfig
 
@@ -83,7 +79,6 @@ class PlayerState:
         has_won: 本局是否已和了
         discards: 舍牌列表（绝对 ID）
         discard_types: 舍牌的牌型集合（用于振听判定）
-        furiten_types: 振听牌型集合（永久振听）
         temp_furiten: 临时振听标记（摸牌后清除）
         is_riichi_furiten: 立直后永久振听（错过和牌机会后永久生效）
         is_tenpai_at_ryuukyoku: 流局时是否听牌
@@ -97,7 +92,6 @@ class PlayerState:
     has_won: bool = False
     discards: List[int] = field(default_factory=list)          # 舍牌的绝对 ID 列表
     discard_types: Set[int] = field(default_factory=set)       # 舍牌的牌型集合（振听判定用）
-    furiten_types: Set[int] = field(default_factory=set)       # 振听牌型集合
     temp_furiten: bool = False   # 临时振听（摸牌后自动清除）
     is_riichi_furiten: bool = False  # 立直后永久振听（错过和牌机会后永久生效）
     is_tenpai_at_ryuukyoku: bool = False  # 流局听牌标记（用于听牌连荘）
@@ -122,7 +116,6 @@ class PlayerState:
         self.has_won = False
         self.discards = []
         self.discard_types = set()
-        self.furiten_types = set()
         self.temp_furiten = False
         self.is_riichi_furiten = False
         self.is_tenpai_at_ryuukyoku = False
@@ -500,8 +493,6 @@ class GameEngine:
         player.hand.remove(tile_type, abs_id)
         player.add_discard(abs_id)
 
-        # 手牌听牌，记录听牌牌型用于振听判定
-        player.furiten_types = set()
         player.temp_furiten = False
 
         self.last_discard = abs_id
@@ -515,25 +506,12 @@ class GameEngine:
         """
         player = self.players[self.current_player]
 
-        # 更新永久振听：检查舍牌中是否包含听牌
-        waits = get_waits(player.hand.tiles)
-        for dt in player.discard_types:
-            if dt in waits:
-                player.furiten_types.add(dt)
-
         abs_id = self._find_abs_to_discard(player, tile_type)
         player.hand.remove(tile_type, abs_id)
         player.add_discard(abs_id)
 
         # 清除临时振听
         player.temp_furiten = False
-
-        # 立直后切牌：再次检查振听（切出的牌如果在听牌列表中）
-        if player.is_riichi:
-            waits = get_waits(player.hand.tiles)
-            for dt in player.discard_types:
-                if dt in waits:
-                    player.furiten_types.add(dt)
 
         self.last_discard = abs_id
         self.last_discard_by = self.current_player
@@ -732,7 +710,6 @@ class GameEngine:
         else:
             num_yakuman = 0
             # 通过手牌分解计算符数
-            from .yaku import decompose_hand
             decomp = decompose_hand(winner_player.hand.tiles)
             if decomp:
                 fu = calculate_fu_from_decomp(
