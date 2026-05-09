@@ -180,17 +180,17 @@ def compute_draw_actions(
 
     # 立直 + 切牌组合（动作索引 37-70，每个索引绑定具体切牌）
     # 注：不开放 mask[36]（独立立直按钮），因当前动作空间用 37-70 表示完整立直+切牌
-    if can_riichi:
-        for t in riichi_discards:
+    riichi_tiles = set(riichi_discards) if can_riichi else set()
+    if riichi_tiles:
+        for t in riichi_tiles:
             actions.append(Action(ActionType.RIICHI, tile=t))
             mask[RIICHI_DISCARD_OFFSET + t] = 1
 
-    # 普通切牌
+    # 普通切牌（立直可切牌只开放 riichi discard 通道，不开放普通 discard）
     for t in range(NUM_TYPES):
-        if hand[t] > 0:
+        if hand[t] > 0 and t not in riichi_tiles:
             mask[DISCARD_OFFSET + t] = 1
-            if not can_riichi or t not in riichi_discards:
-                actions.append(Action(ActionType.DISCARD, tile=t))
+            actions.append(Action(ActionType.DISCARD, tile=t))
 
     # 暗槓
     for t in ankan_options:

@@ -5,6 +5,8 @@ from engine import (
     Action, ActionType,
 )
 from engine.agari import is_agari, is_tenpai
+from engine.hand import Hand, Meld, MeldType
+from engine.yaku import _is_chiitoitsu
 
 
 class TestGameFlow:
@@ -206,4 +208,130 @@ class TestStateTensor:
             tensor = engine.get_state_tensor(p)
             assert tensor is not None
             assert len(tensor.shape) == 1
+
+
+# =============================================================================
+# Review fix regression tests
+# =============================================================================
+
+class TestTenhouDetection:
+    """P1-1: Tenhou should be detectable when dealer has winning initial hand."""
+
+    def test_tenhou_flag_in_can_win(self):
+        """_can_win should set is_tenhou=True for dealer's first tsumo."""
+        from engine.yaku import WinContext, YakuChecker
+        engine = GameEngine(seed=42)
+        # Set up dealer with a winning hand (simple 4 melds + pair)
+        p = engine.players[engine.dealer_idx]
+        p.hand = Hand.from_type_list([0, 0, 0, 1, 1, 1, 2, 2, 2, 9, 9, 9, 27, 27])
+        ctx = engine._build_win_context(engine.dealer_idx, is_tsumo=True, winning_tile=0)
+        assert ctx.is_tenhou, f"Expected tenhou=True for dealer first tsumo, got {ctx.is_tenhou}"
+
+    def test_tenhou_flag_false_after_discard(self):
+        """Tenhou should NOT be set if dealer has already discarded."""
+        engine = GameEngine(seed=42)
+        p = engine.players[engine.dealer_idx]
+        p.add_discard(0)  # mark that dealer has discarded
+        p.hand = Hand.from_type_list([0, 0, 0, 1, 1, 1, 2, 2, 2, 9, 9, 9, 27, 27])
+        ctx = engine._build_win_context(engine.dealer_idx, is_tsumo=True, winning_tile=0)
+        assert not ctx.is_tenhou, "Tenhou should be false after dealer has discarded"
+
+
+class TestChiihouDetection:
+    """P2-2: Chiihou requires no melds or discards from any player."""
+
+    def test_chiihou_detected_for_clean_game(self):
+        """Chiihou should be detected for non-dealer first tsumo in clean game."""
+        engine = GameEngine(seed=42)
+        engine.dealer_idx = 0
+        # Clean state: no discards, no melds for any player
+        p1 = engine.players[1]
+        p1.hand = Hand.from_type_list([0, 0, 0, 1, 1, 1, 2, 2, 2, 9, 9, 9, 27, 27])
+        ctx = engine._build_win_context(1, is_tsumo=True, winning_tile=0)
+        assert ctx.is_chiihou, f"Expected chiihou=True for clean first tsumo, got {ctx.is_chiihou}"
+
+    def test_chiihou_blocked_by_other_discard(self):
+        """Chiihou should be blocked if another player has discarded."""
+        engine = GameEngine(seed=42)
+        engine.dealer_idx = 0
+        engine.players[0].add_discard(1)  # dealer discarded
+        p1 = engine.players[1]
+        p1.hand = Hand.from_type_list([0, 0, 0, 1, 1, 1, 2, 2, 2, 9, 9, 9, 27, 27])
+        ctx = engine._build_win_context(1, is_tsumo=True, winning_tile=0)
+        assert not ctx.is_chiihou, "Chiihou should be false if dealer has discarded"
+
+
+class TestDoubleRiichi:
+    """P2-3: Double riichi requires no melds from any player."""
+
+    def test_double_riichi_allowed_clean(self):
+        engine = GameEngine(seed=42)
+        # Ensure all players have clean state
+        for p in engine.players:
+            p.discards.clear()
+            p.hand.melds.clear()
+        # Give dealer a valid hand with tile 0
+        engine.players[0].hand.add(0)
+        # Dealer declares riichi with discard of tile 0
+        engine._handle_riichi_discard(0)
+        assert engine.players[engine.dealer_idx].is_double_riichi
+
+
+class TestChiitoitsuFu:
+    """P2-1: Chiitoitsu should use 25 fu, not 30."""
+
+    def test_chiitoitsu_25_fu(self):
+        """Verify that _is_chiitoitsu detects 7 pairs correctly."""
+        # 7 pairs as histogram: each of 7 types has count 2
+        tiles_hist = [0] * 34
+        for t in [0, 1, 2, 9, 10, 11, 27]:
+            tiles_hist[t] = 2
+        assert _is_chiitoitsu(tiles_hist), "Hand should be chiitoitsu"
+
+
+class TestRyanhanShibari:
+    """P1-2: Ryanhan shibari blocks win before state corruption."""
+
+    def test_ryanhan_shibari_blocks_tsumo(self):
+        """Tsumo with < 2 han under ryanhan_shibari should be rejected."""
+        engine = GameEngine(seed=42)
+        engine.honba = 5
+        engine.config.ryanhan_shibari = True
+
+        # Prevent tenhou detection (dealer already discarded)
+        engine.players[engine.dealer_idx].add_discard(0)
+
+        # Valid winning hand: 234m 678m 345p(chi) 567s + 22s pair
+        # Open meld → not menzen → no menzen tsumo/pinfu
+        # Tanyao only = 1 han. Dora type 8 (9m) doesn't match → 0 dora.
+        p = engine.players[engine.dealer_idx]
+        p.hand = Hand.from_type_list([1, 2, 3, 5, 6, 7, 19, 19, 22, 23, 24])
+        p.hand.melds.append(Meld(MeldType.CHI, [10, 11, 12],
+                                 called_from=2, source_tile=12))
+
+        engine._last_drawn_tile = 24  # 7s
+        engine._handle_tsumo(engine.dealer_idx)
+        assert not p.has_won, "Player should not be marked as won under ryanhan shibari"
+        assert engine.phase != GamePhase.AGARI, "Phase should not be AGARI when blocked"
+
+    def test_ryanhan_shibari_allows_2han(self):
+        """Tsumo with >= 2 han under ryanhan_shibari should succeed."""
+        engine = GameEngine(seed=42)
+        engine.honba = 5
+        engine.config.ryanhan_shibari = True
+
+        # Prevent tenhou detection
+        engine.players[engine.dealer_idx].add_discard(0)
+
+        # Menzen hand: 234m 678m 345p 567s + 22s pair
+        # Menzen tsumo (1) + tanyao (1) = 2 han → allowed
+        p = engine.players[engine.dealer_idx]
+        p.hand = Hand.from_type_list([1, 2, 3, 5, 6, 7, 11, 12, 13,
+                                      19, 19, 22, 23, 24])
+
+        engine._last_drawn_tile = 24  # 7s
+        engine._handle_tsumo(engine.dealer_idx)
+        assert p.has_won, "Player should be marked as won with 2 han"
+        assert engine.phase == GamePhase.AGARI
 # 中文注释：验证游戏引擎主流程，包括初始化、摸切、响应、和牌与流局状态迁移。
+

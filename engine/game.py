@@ -410,17 +410,28 @@ class GameEngine:
         手牌 + 刚摸的牌 → 确认和牌。检查役种并计算得点。
         """
         player = self.players[winner]
+
+        # 役种检查（在修改状态前完成）
+        ctx = self._build_win_context(winner, is_tsumo=True, winning_tile=self._last_drawn_tile)
+        checker = YakuChecker(ctx)
+        result = checker.check_all()
+
+        # 二翻缚规则：5 本场以上需要 2 翻起和（在修改状态前阻止）
+        if self.config.ryanhan_shibari and self.honba >= 5 and not result.is_yakuman:
+            dora_types = self.wall.get_dora_types()
+            all_tiles = list(player.hand.tiles)
+            dora_count = count_dora_in_hand(all_tiles, dora_types)
+            if self.config.aka_dora:
+                dora_count += len(player.hand.aka_tiles)
+            if result.total_han + dora_count < 2:
+                return  # 不满足二翻缚，拒绝和牌
+
         player.has_won = True
         self._last_winner = winner
         self._last_agari_payments = []
         self._last_win_is_tsumo = True
         self._last_win_loser = -1
         self._last_win_tile = self._last_drawn_tile
-
-        # 役种检查
-        ctx = self._build_win_context(winner, is_tsumo=True, winning_tile=self._last_drawn_tile)
-        checker = YakuChecker(ctx)
-        result = checker.check_all()
         self._last_yaku_result = result
 
         # 计算并执行支付
@@ -433,13 +444,6 @@ class GameEngine:
         获胜者手牌 + 放铳牌 → 确认和牌。放铳者全额支付。
         """
         player = self.players[winner]
-        player.has_won = True
-        self._last_winner = winner
-        if self.phase != GamePhase.AGARI:
-            self._last_agari_payments = []
-        self._last_win_is_tsumo = False
-        self._last_win_loser = self.last_discard_by
-        self._last_win_tile = winning_tile_type
 
         # 将放铳牌临时加入手牌进行役种检查
         player.hand.add(winning_tile_type)
@@ -447,9 +451,26 @@ class GameEngine:
         ctx = self._build_win_context(winner, is_tsumo=False, winning_tile=winning_tile_type)
         checker = YakuChecker(ctx)
         result = checker.check_all()
-        self._last_yaku_result = result
 
-        # 放铳牌保留在手中（用于手牌分解和符计算）
+        # 二翻缚规则：5 本场以上需要 2 翻起和（在修改状态前阻止）
+        if self.config.ryanhan_shibari and self.honba >= 5 and not result.is_yakuman:
+            dora_types = self.wall.get_dora_types()
+            all_tiles = list(player.hand.tiles)
+            dora_count = count_dora_in_hand(all_tiles, dora_types)
+            if self.config.aka_dora:
+                dora_count += len(player.hand.aka_tiles)
+            if result.total_han + dora_count < 2:
+                player.hand.remove(winning_tile_type)  # 回滚临时加入
+                return  # 不满足二翻缚，拒绝和牌
+
+        player.has_won = True
+        self._last_winner = winner
+        if self.phase != GamePhase.AGARI:
+            self._last_agari_payments = []
+        self._last_win_is_tsumo = False
+        self._last_win_loser = self.last_discard_by
+        self._last_win_tile = winning_tile_type
+        self._last_yaku_result = result
 
         self._settle_payments(winner, result, is_tsumo=False, loser=self.last_discard_by)
         self.phase = GamePhase.AGARI
@@ -468,8 +489,10 @@ class GameEngine:
         player.is_riichi = True
         player.is_ippatsu = True  # 一発在下一巡摸牌前有效
 
-        # 双立直检查（第一巡无人鸣牌即立直）
-        if len(player.discards) == 0:
+        # 双立直检查：第一巡、无人鸣牌（包括别家）、且是首次舍牌
+        if (len(player.discards) == 0
+                and all(len(p.discards) == 0 and len(p.hand.melds) == 0
+                       for p in self.players)):
             player.is_double_riichi = True
 
         # 切牌
@@ -723,7 +746,11 @@ class GameEngine:
                     jikaze=winner_player.seat_wind,
                 )
             else:
-                fu = 30  # 七对子/国士无双 默认 30 符
+                # 七对子固定 25 符（日麻标准规则）；国士无双走役满分支 fu=0
+                if _is_chiitoitsu(winner_player.hand.tiles):
+                    fu = 25
+                else:
+                    fu = 30
 
         # 宝牌计算（表宝牌 + 里宝牌 + 赤宝牌）
         dora_types = self.wall.get_dora_types(with_ura=winner_player.is_riichi,
@@ -744,9 +771,12 @@ class GameEngine:
         if yaku_result.is_yakuman:
             total_han = 0  # 役满使用独立得点体系
 
-        # 二翻缚规则：5 本场以上需要 2 翻起和
-        if self.config.ryanhan_shibari and self.honba >= 5 and total_han < 2:
-            return  # 不足 2 翻 → 不能和牌
+        # 二翻缚已由 _handle_tsumo / _handle_ron 在修改状态前检查，
+        # 此处保留断言式检查作为安全网（正常流程不会触发）
+        if self.config.ryanhan_shibari and self.honba >= 5 and total_han < 2 \
+                and not yaku_result.is_yakuman:
+            raise RuntimeError(
+                f"ryanhan_shibari violated: honba={self.honba} total_han={total_han}")
 
         payment = compute_payments(
             han=total_han,
@@ -831,11 +861,14 @@ class GameEngine:
             is_riichi=player.is_riichi,
             is_ippatsu=player.is_ippatsu and player.is_riichi,
             is_double_riichi=player.is_double_riichi,
-            # 天和：庄家配牌 14 张即和牌（非摸牌后），故 winning_tile=-1
-            is_tenhou=(winner == self.dealer_idx and len(player.discards) == 0 and is_tsumo
-                       and self._last_drawn_tile == -1),
-            # 地和：闲家第一巡摸牌即和（此前无人鸣牌/舍牌）
-            is_chiihou=(winner != self.dealer_idx and len(player.discards) == 0 and is_tsumo),
+            # 天和：庄家第一巡摸牌即和（14 张配牌即听），discards 为空即首次行动
+            is_tenhou=(winner == self.dealer_idx and len(player.discards) == 0
+                       and is_tsumo),
+            # 地和：闲家第一巡摸牌即和，且此前无人鸣牌、舍牌（全局仍"干净"）
+            is_chiihou=(winner != self.dealer_idx and len(player.discards) == 0
+                        and is_tsumo
+                        and all(len(p.discards) == 0 and len(p.hand.melds) == 0
+                                for p in self.players)),
             bakaze=self.round_wind,
             jikaze=player.seat_wind,
             kuitan=self.config.kuitan,
@@ -1116,9 +1149,12 @@ class GameEngine:
             is_riichi=player.is_riichi,
             is_ippatsu=player.is_ippatsu and player.is_riichi,
             is_double_riichi=player.is_double_riichi,
-            is_tenhou=(player_idx == self.dealer_idx and len(player.discards) == 0 and is_tsumo
-                       and self._last_drawn_tile == -1),
-            is_chiihou=(player_idx != self.dealer_idx and len(player.discards) == 0 and is_tsumo),
+            is_tenhou=(player_idx == self.dealer_idx and len(player.discards) == 0
+                       and is_tsumo),
+            is_chiihou=(player_idx != self.dealer_idx and len(player.discards) == 0
+                        and is_tsumo
+                        and all(len(p.discards) == 0 and len(p.hand.melds) == 0
+                                for p in self.players)),
             bakaze=self.round_wind,
             jikaze=player.seat_wind,
             kuitan=self.config.kuitan,
