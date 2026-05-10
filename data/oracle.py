@@ -75,17 +75,15 @@ def _max_score_suit(counts: Tuple[int, ...], allow_sequence: bool) -> Tuple[int,
     # ── A. 跳过 1 张（当剩余单张处理，贡献为 0） ──
     c[idx] -= 1
     m, t, p = _max_score_suit(tuple(c), allow_sequence)
-    # 优先用 melds 大、taatsu 大的组合
-    _update_best((best_m, best_t, best_p), (m, t, p))
-    best_m, best_t, best_p = m, t, p
+    best_m, best_t, best_p = m, t, p  # baseline
     c[idx] += 1
 
     # ── B. 形成对子（has_pair=1，不计入 taatsu） ──
-    if tile >= 2 and best_p == 0:
+    if tile >= 2:
         c[idx] -= 2
         m, t, p = _max_score_suit(tuple(c), allow_sequence)
-        _update_best((best_m, best_t, best_p), (m, t, 1))
-        best_m, best_t, best_p = m, t, 1
+        if _update_best((best_m, best_t, best_p), (m, t, 1)):
+            best_m, best_t, best_p = m, t, 1
         c[idx] += 2
 
     # ── C. 形成搭子（taatsu+1） ──
@@ -95,8 +93,8 @@ def _max_score_suit(counts: Tuple[int, ...], allow_sequence: bool) -> Tuple[int,
         c[idx] -= 1
         c[idx + 1] -= 1
         m, t, p = _max_score_suit(tuple(c), allow_sequence)
-        _update_best((best_m, best_t, best_p), (m, t + 1, p))
-        best_m, best_t, best_p = m, t + 1, p
+        if _update_best((best_m, best_t, best_p), (m, t + 1, p)):
+            best_m, best_t, best_p = m, t + 1, p
         c[idx] += 1
         c[idx + 1] += 1
 
@@ -105,8 +103,8 @@ def _max_score_suit(counts: Tuple[int, ...], allow_sequence: bool) -> Tuple[int,
         c[idx] -= 1
         c[idx + 2] -= 1
         m, t, p = _max_score_suit(tuple(c), allow_sequence)
-        _update_best((best_m, best_t, best_p), (m, t + 1, p))
-        best_m, best_t, best_p = m, t + 1, p
+        if _update_best((best_m, best_t, best_p), (m, t + 1, p)):
+            best_m, best_t, best_p = m, t + 1, p
         c[idx] += 1
         c[idx + 2] += 1
 
@@ -116,8 +114,8 @@ def _max_score_suit(counts: Tuple[int, ...], allow_sequence: bool) -> Tuple[int,
     if tile >= 3:
         c[idx] -= 3
         m, t, p = _max_score_suit(tuple(c), allow_sequence)
-        _update_best((best_m, best_t, best_p), (m + 1, t, p))
-        best_m, best_t, best_p = m + 1, t, p
+        if _update_best((best_m, best_t, best_p), (m + 1, t, p)):
+            best_m, best_t, best_p = m + 1, t, p
         c[idx] += 3
 
     # D2. 顺子
@@ -126,8 +124,8 @@ def _max_score_suit(counts: Tuple[int, ...], allow_sequence: bool) -> Tuple[int,
         c[idx + 1] -= 1
         c[idx + 2] -= 1
         m, t, p = _max_score_suit(tuple(c), allow_sequence)
-        _update_best((best_m, best_t, best_p), (m + 1, t, p))
-        best_m, best_t, best_p = m + 1, t, p
+        if _update_best((best_m, best_t, best_p), (m + 1, t, p)):
+            best_m, best_t, best_p = m + 1, t, p
         c[idx] += 1
         c[idx + 1] += 1
         c[idx + 2] += 1
@@ -539,14 +537,15 @@ def compute_all_oracle_labels(tiles: List[int]) -> dict:
     tenpai = is_tenpai(tiles)
 
     result = {
-        'shanten': shanten,                          # int 0-6
-        'ukeire_count': ukeire_count,                # int 0-34
-        'ukeire_mask': ukeire_mask,                  # List[bool] length 34
-        'ukeire_available': ukeire_available,        # int 有效进张剩余牌种数
-        'is_tenpai': tenpai,                         # bool
-        'efficiency_score': 0.0,                     # 占位，后续计算
-        'danger_map': [0.0] * NUM_TYPES,             # 占位，后续计算
-        'score_estimate': 0.0,                       # 占位，后续计算
+        'shanten': shanten,                          # int 0-6 (real value)
+        'ukeire_count': ukeire_count,                # int 0-34 (real value)
+        'ukeire_mask': ukeire_mask,                  # List[bool] 34 (real value)
+        'ukeire_available': ukeire_available,        # int (real value)
+        'is_tenpai': tenpai,                         # bool (real value)
+        # ── TODO / Placeholder ──────────────────────────────────────────
+        'efficiency_score': 0.0,                     # TODO: not yet implemented
+        'danger_map': [0.0] * NUM_TYPES,             # TODO: not yet implemented
+        'score_estimate': 0.0,                       # TODO: not yet implemented
     }
 
     if tenpai:

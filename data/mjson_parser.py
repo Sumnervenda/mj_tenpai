@@ -115,6 +115,9 @@ class MJSONGameTracker:
     remaining_tiles: int = 70
     aka_flag: bool = True
     tenpai_at_ryuukyoku: List[bool] = field(default_factory=lambda: [False]*4)
+    aka_counts: List[Dict[int, int]] = field(
+        default_factory=lambda: [{} for _ in range(4)]
+    )  # per-player: type_id → count of red/aka copies in hand
 
     def reset_round(self):
         self.hands = [[0]*34 for _ in range(4)]
@@ -130,6 +133,7 @@ class MJSONGameTracker:
         self.last_discard_by = -1
         self.remaining_tiles = 70
         self.tenpai_at_ryuukyoku = [False]*4
+        self.aka_counts = [{} for _ in range(4)]
 
     # ── 事件应用 ────────────────────────────────────────────────────────
 
@@ -139,11 +143,33 @@ class MJSONGameTracker:
         if handler:
             handler(event)
 
+    def _is_aka_tile_str(self, tile_str: str) -> bool:
+        """Check if an MJSON tile string represents a red/aka tile."""
+        return tile_str in ('5mr', '5pr', '5sr')
+
+    def _add_aka(self, player: int, tile_str: str) -> None:
+        """Track an aka tile entering a player's hand."""
+        if self._is_aka_tile_str(tile_str):
+            t = mjson_str_to_type(tile_str)
+            if t >= 0:
+                self.aka_counts[player][t] = \
+                    self.aka_counts[player].get(t, 0) + 1
+
+    def _remove_aka(self, player: int, tile_str: str) -> None:
+        """Track an aka tile leaving a player's hand."""
+        if self._is_aka_tile_str(tile_str):
+            t = mjson_str_to_type(tile_str)
+            if t >= 0 and self.aka_counts[player].get(t, 0) > 0:
+                self.aka_counts[player][t] -= 1
+                if self.aka_counts[player][t] <= 0:
+                    del self.aka_counts[player][t]
+
     def _on_start_game(self, e: dict):
         self.aka_flag = e.get('aka_flag', True)
 
     def _on_start_kyoku(self, e: dict):
         self.reset_round()
+        _build_tile_map()
         self.bakaze = _MJSON_TO_TYPE.get(e['bakaze'], 27)
         self.kyoku = e.get('kyoku', 1)
         self.honba = e.get('honba', 0)
@@ -157,12 +183,14 @@ class MJSONGameTracker:
                 t = mjson_str_to_type(tile_str)
                 if t >= 0:
                     self.hands[p_idx][t] += 1
+                self._add_aka(p_idx, tile_str)
 
     def _on_tsumo(self, e: dict):
         actor = e['actor']
         t = mjson_str_to_type(e['pai'])
         if t >= 0:
             self.hands[actor][t] += 1
+        self._add_aka(actor, e['pai'])
         self.remaining_tiles -= 1
 
     def _on_dahai(self, e: dict):
@@ -171,6 +199,7 @@ class MJSONGameTracker:
         if t >= 0:
             self.hands[actor][t] -= 1
             self.discards[actor].append(t)
+        self._remove_aka(actor, e['pai'])
         self.last_discard_type = t
         self.last_discard_by = actor
         if self.pending_reach == actor:
@@ -195,6 +224,8 @@ class MJSONGameTracker:
         for t in consumed:
             if t >= 0:
                 self.hands[actor][t] -= 1
+        for s in e.get('consumed', []):
+            self._remove_aka(actor, s)
         all_tiles = consumed + [called_tile]
         all_tiles.sort()
         self.melds[actor].append(('chi', all_tiles, e.get('target', -1)))
@@ -207,6 +238,8 @@ class MJSONGameTracker:
         for t in consumed:
             if t >= 0:
                 self.hands[actor][t] -= 1
+        for s in e.get('consumed', []):
+            self._remove_aka(actor, s)
         all_tiles = consumed + [called_tile]
         self.melds[actor].append(('pon', all_tiles, e.get('target', -1)))
         self.last_discard_type = -1
@@ -218,6 +251,8 @@ class MJSONGameTracker:
         for t in consumed:
             if t >= 0:
                 self.hands[actor][t] -= 1
+        for s in e.get('consumed', []):
+            self._remove_aka(actor, s)
         all_tiles = consumed + [called_tile]
         self.melds[actor].append(('daiminkan', all_tiles, e.get('target', -1)))
         self.last_discard_type = -1
@@ -228,6 +263,8 @@ class MJSONGameTracker:
         for t in consumed:
             if t >= 0:
                 self.hands[actor][t] -= 1
+        for s in e.get('consumed', []):
+            self._remove_aka(actor, s)
         self.melds[actor].append(('ankan', consumed, -1))
 
     def _on_kakan(self, e: dict):
@@ -235,6 +272,7 @@ class MJSONGameTracker:
         added_tile = mjson_str_to_type(e['pai'])
         if added_tile >= 0:
             self.hands[actor][added_tile] -= 1
+        self._remove_aka(actor, e['pai'])
         consumed = [mjson_str_to_type(s) for s in e.get('consumed', [])]
         self.melds[actor].append(('kakan', consumed + [added_tile], -1))
 
@@ -660,6 +698,135 @@ class MJSONRecordParser:
 
         return samples
 
+    def parse_file_token_samples(self, filepath: str
+                                  ) -> List[Tuple[List[int], List[int],
+                                                  List[int], np.ndarray, int]]:
+        """解析单个 .mjson 文件，返回 token 序列样本。
+
+        每个样本为 (token_ids, token_types, behavior_ids, action_mask, label)。
+
+        与 parse_file() 相同的回放逻辑，但输出格式为 Transformer 训练所需的
+        token 序列，而非 ResNet 354 维状态张量。
+        """
+        events = []
+        try:
+            if self._is_gzipped(filepath):
+                opener = gzip.open(filepath, 'rb')
+            else:
+                opener = open(filepath, 'rb')
+            with opener as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        events.append(_loads_json_line(line))
+        except (EOFError, json.JSONDecodeError) as e:
+            if self.verbose:
+                print(f"  Skipping {filepath}: {e}")
+            return []
+        return self._replay_game_token_samples(events)
+
+    def _replay_game_token_samples(self, events: List[dict]
+                                    ) -> List[Tuple[List[int], List[int],
+                                                    List[int], np.ndarray, int]]:
+        """回放对局事件流，提取 token 序列训练样本。"""
+        from models.tokenizer import MahjongTokenizer
+        tokenizer = MahjongTokenizer()
+        tracker = MJSONGameTracker()
+        samples: List[Tuple[List[int], List[int], List[int],
+                            np.ndarray, int]] = []
+
+        def _capture(actor, mask, action):
+            seq = tokenizer.tokenize_game_snapshot(tracker, actor)
+            samples.append((
+                seq.token_ids,
+                seq.token_types,
+                seq.behavior_ids,
+                mask.astype(np.float32, copy=False),
+                action,
+            ))
+
+        for i, event in enumerate(events):
+            etype = event.get('type', '')
+
+            if etype == 'dahai':
+                actor = event['actor']
+                tile_str = event.get('pai', '')
+                tile_t = mjson_str_to_type(tile_str)
+                mask = tracker.build_draw_mask(actor)
+
+                if tracker.pending_reach == actor:
+                    action = 37 + tile_t
+                else:
+                    action = tile_t
+
+                if mask[tile_t] > 0 or mask[37 + tile_t] > 0:
+                    _capture(actor, mask.copy(), action)
+
+            tracker.apply_event(event)
+
+            if etype in ('chi', 'pon', 'daiminkan'):
+                actor = event['actor']
+                self._rollback_event(tracker, event)
+                mask = tracker.build_response_mask(actor)
+                action_map = {'chi': 72, 'pon': 71, 'daiminkan': 73}
+                action = action_map.get(etype, 76)
+                mask[action] = 1.0
+                _capture(actor, mask.copy(), action)
+                tracker.apply_event(event)
+
+            elif etype == 'ankan':
+                actor = event['actor']
+                self._rollback_event(tracker, event)
+                mask = tracker.build_draw_mask(actor)
+                mask[74] = 1.0
+                _capture(actor, mask.copy(), 74)
+                tracker.apply_event(event)
+
+            elif etype == 'kakan':
+                actor = event['actor']
+                self._rollback_event(tracker, event)
+                mask = tracker.build_draw_mask(actor)
+                mask[75] = 1.0
+                _capture(actor, mask.copy(), 75)
+                tracker.apply_event(event)
+
+            elif etype == 'hora':
+                actor = event['actor']
+                target = event.get('target', actor)
+                self._rollback_event(tracker, event)
+                if actor == target:
+                    mask = tracker.build_draw_mask(actor)
+                    mask[34] = 1.0
+                    _capture(actor, mask.copy(), 34)
+                else:
+                    mask = tracker.build_response_mask(actor)
+                    mask[35] = 1.0
+                    _capture(actor, mask.copy(), 35)
+                tracker.apply_event(event)
+
+            elif etype == 'dahai':
+                discarding_player = event['actor']
+                responding_players: set = set()
+                for ne in events[i+1:]:
+                    nt = ne.get('type', '')
+                    if nt in ('chi', 'pon', 'daiminkan', 'hora', 'ankan', 'kakan'):
+                        responding_players.add(ne.get('actor', -1))
+                    elif nt in ('tsumo', 'dahai', 'reach', 'ryukyoku'):
+                        break
+                for p_idx in range(4):
+                    if p_idx == discarding_player:
+                        continue
+                    if tracker.is_riichi[p_idx]:
+                        continue
+                    if p_idx in responding_players:
+                        continue
+                    resp_mask = tracker.build_response_mask(p_idx)
+                    if resp_mask[35] > 0 or resp_mask[71] > 0 \
+                            or resp_mask[72] > 0 or resp_mask[73] > 0:
+                        _capture(p_idx, resp_mask.copy(), 76)
+
+        return samples
+
     def _rollback_event(self, tracker: MJSONGameTracker, event: dict):
         """回滚单个事件对 tracker 的状态修改。"""
         etype = event.get('type', '')
@@ -678,6 +845,8 @@ class MJSONRecordParser:
             for t in consumed:
                 if t >= 0:
                     tracker.hands[actor][t] += 1
+            for s in event.get('consumed', []):
+                tracker._add_aka(actor, s)
             if tracker.melds[actor]:
                 tracker.melds[actor].pop()
         elif etype == 'pon':
@@ -686,6 +855,8 @@ class MJSONRecordParser:
             for t in consumed:
                 if t >= 0:
                     tracker.hands[actor][t] += 1
+            for s in event.get('consumed', []):
+                tracker._add_aka(actor, s)
             if tracker.melds[actor]:
                 tracker.melds[actor].pop()
         elif etype == 'daiminkan':
@@ -694,6 +865,8 @@ class MJSONRecordParser:
             for t in consumed:
                 if t >= 0:
                     tracker.hands[actor][t] += 1
+            for s in event.get('consumed', []):
+                tracker._add_aka(actor, s)
             if tracker.melds[actor]:
                 tracker.melds[actor].pop()
         elif etype == 'ankan':
@@ -702,6 +875,8 @@ class MJSONRecordParser:
             for t in consumed:
                 if t >= 0:
                     tracker.hands[actor][t] += 1
+            for s in event.get('consumed', []):
+                tracker._add_aka(actor, s)
             if tracker.melds[actor]:
                 tracker.melds[actor].pop()
         elif etype == 'kakan':
@@ -710,6 +885,142 @@ class MJSONRecordParser:
             t = mjson_str_to_type(tile_str)
             if t >= 0:
                 tracker.hands[actor][t] += 1
+            tracker._add_aka(actor, tile_str)
             if tracker.melds[actor]:
                 tracker.melds[actor].pop()
+    # ── Teacher mode: public + private token samples ──────────────────
+
+    def parse_file_public_private_token_samples(
+            self, filepath: str
+    ) -> List[Tuple[List[int], List[int], List[int], np.ndarray, int,
+                    List[int], List[int], List[int]]]:
+        """解析单个 .mjson 文件，返回含 private tokens 的 token 序列样本。
+
+        每个样本为 (token_ids, token_types, behavior_ids, action_mask, label,
+                     priv_token_ids, priv_token_types, priv_behavior_ids)。
+        """
+        events = []
+        try:
+            if self._is_gzipped(filepath):
+                opener = gzip.open(filepath, 'rb')
+            else:
+                opener = open(filepath, 'rb')
+            with opener as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        events.append(_loads_json_line(line))
+        except (EOFError, json.JSONDecodeError) as e:
+            if self.verbose:
+                print(f"  Skipping {filepath}: {e}")
+            return []
+        return self._replay_game_public_private_token_samples(events)
+
+    def _replay_game_public_private_token_samples(
+            self, events: List[dict]
+    ) -> List[Tuple[List[int], List[int], List[int], np.ndarray, int,
+                    List[int], List[int], List[int]]]:
+        """回放对局事件流，提取 public + private token 序列训练样本。"""
+        from models.tokenizer import MahjongTokenizer
+        tokenizer = MahjongTokenizer()
+        tracker = MJSONGameTracker()
+        samples: List[Tuple[List[int], List[int], List[int], np.ndarray, int,
+                            List[int], List[int], List[int]]] = []
+
+        def _capture(actor, mask, action):
+            pub, priv = tokenizer.tokenize_public_private_snapshot(tracker, actor)
+            samples.append((
+                pub.token_ids,
+                pub.token_types,
+                pub.behavior_ids,
+                mask.astype(np.float32, copy=False),
+                action,
+                priv.token_ids,
+                priv.token_types,
+                priv.behavior_ids,
+            ))
+
+        for i, event in enumerate(events):
+            etype = event.get('type', '')
+
+            if etype == 'dahai':
+                actor = event['actor']
+                tile_str = event.get('pai', '')
+                tile_t = mjson_str_to_type(tile_str)
+                mask = tracker.build_draw_mask(actor)
+
+                if tracker.pending_reach == actor:
+                    action = 37 + tile_t
+                else:
+                    action = tile_t
+
+                if mask[tile_t] > 0 or mask[37 + tile_t] > 0:
+                    _capture(actor, mask.copy(), action)
+
+            tracker.apply_event(event)
+
+            if etype in ('chi', 'pon', 'daiminkan'):
+                actor = event['actor']
+                self._rollback_event(tracker, event)
+                mask = tracker.build_response_mask(actor)
+                action_map = {'chi': 72, 'pon': 71, 'daiminkan': 73}
+                action = action_map.get(etype, 76)
+                mask[action] = 1.0
+                _capture(actor, mask.copy(), action)
+                tracker.apply_event(event)
+
+            elif etype == 'ankan':
+                actor = event['actor']
+                self._rollback_event(tracker, event)
+                mask = tracker.build_draw_mask(actor)
+                mask[74] = 1.0
+                _capture(actor, mask.copy(), 74)
+                tracker.apply_event(event)
+
+            elif etype == 'kakan':
+                actor = event['actor']
+                self._rollback_event(tracker, event)
+                mask = tracker.build_draw_mask(actor)
+                mask[75] = 1.0
+                _capture(actor, mask.copy(), 75)
+                tracker.apply_event(event)
+
+            elif etype == 'hora':
+                actor = event['actor']
+                target = event.get('target', actor)
+                self._rollback_event(tracker, event)
+                if actor == target:
+                    mask = tracker.build_draw_mask(actor)
+                    mask[34] = 1.0
+                    _capture(actor, mask.copy(), 34)
+                else:
+                    mask = tracker.build_response_mask(actor)
+                    mask[35] = 1.0
+                    _capture(actor, mask.copy(), 35)
+                tracker.apply_event(event)
+
+            elif etype == 'dahai':
+                discarding_player = event['actor']
+                responding_players: set = set()
+                for ne in events[i+1:]:
+                    nt = ne.get('type', '')
+                    if nt in ('chi', 'pon', 'daiminkan', 'hora', 'ankan', 'kakan'):
+                        responding_players.add(ne.get('actor', -1))
+                    elif nt in ('tsumo', 'dahai', 'reach', 'ryukyoku'):
+                        break
+                for p_idx in range(4):
+                    if p_idx == discarding_player:
+                        continue
+                    if tracker.is_riichi[p_idx]:
+                        continue
+                    if p_idx in responding_players:
+                        continue
+                    resp_mask = tracker.build_response_mask(p_idx)
+                    if resp_mask[35] > 0 or resp_mask[71] > 0 \
+                            or resp_mask[72] > 0 or resp_mask[73] > 0:
+                        _capture(p_idx, resp_mask.copy(), 76)
+
+        return samples
+
+
 # 中文注释：解析雀魂/Tenhou 转换后的 MJSON 牌谱，并抽取状态、动作、mask 三元组。

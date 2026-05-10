@@ -8,13 +8,16 @@
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 
 from engine.game import GameEngine, GameConfig, GamePhase, GameState
 from engine.actions import Action, ActionType, LegalActions
+
+# Agent 抽象接口（优先使用），同时保持对裸 MahjongPolicyValueNet 的向后兼容
+from .agents import Agent, ResNetAgent
 from models import MahjongPolicyValueNet
 
 
@@ -49,39 +52,66 @@ class SelfPlayEnv:
     当 baseline_model 传入时：trainee_idx 玩家使用 self.model + reward_shaper，
     其余三家使用 frozen baseline_model，仅收集 trainee 的轨迹数据。
 
+    支持两种初始化方式（向后兼容）：
+      - SelfPlayEnv(model=MahjongPolicyValueNet, ...)  # 原有接口，自动包装为 ResNetAgent
+      - SelfPlayEnv(agent=Agent, ...)                   # 新接口，直接传入 Agent 实例
+
     Args:
-        model: 策略-价值双头网络（trainee / 待训练模型）
+        model: 策略-价值双头网络（trainee / 待训练模型），与 agent 二选一
+        agent: Agent 实例（优先），与 model 二选一
         device: 推理设备
         deterministic: True 时选最大概率动作（评估），False 时按分布采样（训练）
         reward_shaper: 奖励塑形器，仅对 trainee 生效
         trainee_idx: 被训练玩家的座位索引 (0-3)
-        baseline_model: 对手使用的冻结模型，None 表示与 model 相同
+        baseline_model: 对手使用的冻结模型（自动包装为 ResNetAgent）
+        baseline_agent: 对手使用的 Agent 实例（优先于 baseline_model）
+        kl_coef: KL 正则系数
     """
 
     def __init__(self,
-                 model: MahjongPolicyValueNet,
+                 model: Optional[MahjongPolicyValueNet] = None,
                  device: str = 'cpu',
                  deterministic: bool = False,
                  reward_shaper: object = None,
                  trainee_idx: int = 0,
-                 baseline_model: MahjongPolicyValueNet | None = None,
-                 kl_coef: float = 0.01):
-        self.model = model
+                 baseline_model: Optional[MahjongPolicyValueNet] = None,
+                 baseline_agent: Optional[Agent] = None,
+                 kl_coef: float = 0.01,
+                 agent: Optional[Agent] = None):
         self.device = device
         self.deterministic = deterministic
         self.reward_shaper = reward_shaper
         self.trainee_idx = trainee_idx
-        self.baseline_model = baseline_model
         self.kl_coef = kl_coef
         self._game_id_counter = 0
 
-    def _model_for(self, player_idx: int) -> MahjongPolicyValueNet:
-        """返回指定玩家的推理模型：trainee 用训练模型，对手用 frozen baseline。"""
+        # 解析 trainee agent：优先 agent 参数，否则从 model 包装
+        if agent is not None:
+            self.agent = agent
+            self.model = None  # 无裸模型引用（不用于反向兼容 run_eval 等）
+        elif model is not None:
+            self.agent = ResNetAgent(model, device=device)
+            self.model = model  # 保留裸模型引用，用于反向兼容
+        else:
+            raise ValueError("Must provide either 'agent' or 'model'")
+
+        # 解析 baseline agent
+        if baseline_agent is not None:
+            self.baseline_agent: Optional[Agent] = baseline_agent
+        elif baseline_model is not None:
+            self.baseline_agent = ResNetAgent(baseline_model, device=device)
+        else:
+            self.baseline_agent = None
+        # 保留裸模型引用，用于 run_eval 等直接访问的场景
+        self.baseline_model = baseline_model
+
+    def _agent_for(self, player_idx: int) -> Agent:
+        """返回指定玩家的 Agent：trainee 用训练 agent，对手用 baseline。"""
         if player_idx == self.trainee_idx:
-            return self.model
-        if self.baseline_model is not None:
-            return self.baseline_model
-        return self.model
+            return self.agent
+        if self.baseline_agent is not None:
+            return self.baseline_agent
+        return self.agent
 
     @torch.no_grad()
     def _select_action(self, player_idx: int,
@@ -92,29 +122,23 @@ class SelfPlayEnv:
             action_idx: 选中的动作索引 (0-76)
             log_prob: 该动作的对数概率
             value: 状态价值
-            sl_log_prob: SL 冻结策略下该动作的对数概率（KL 正则化用）
+            sl_log_prob: SL 冻结策略的 log_prob（KL 正则化用，baseline 不可用时为 0）
         """
-        state_np = engine.get_state_tensor(player_idx)
-        legal = engine.get_legal_actions(player_idx)
+        ag = self._agent_for(player_idx)
+        action_idx, log_prob, value = ag.select_action(
+            engine, player_idx, deterministic=self.deterministic)
 
-        state_t = torch.from_numpy(state_np).float().to(self.device)
-        mask_t = torch.tensor(legal.mask, dtype=torch.float32).to(self.device)
-
-        m = self._model_for(player_idx)
-        action_idx, log_prob = m.get_action(
-            state_t, mask_t, deterministic=self.deterministic)
-
-        _, value_t = m.forward(state_t, mask_t)
-        value = value_t.item()
-
-        # KL 正则化：计算 SL 冻结策略下该动作的 log prob
+        # KL 正则化：baseline agent 的 deterministic log_prob
         sl_log_prob = 0.0
-        if player_idx == self.trainee_idx and self.baseline_model is not None:
-            _, sl_lp = self.baseline_model.get_action(
-                state_t, mask_t, deterministic=True)
-            sl_log_prob = sl_lp.item()
+        if player_idx == self.trainee_idx and self.baseline_agent is not None:
+            try:
+                _, sl_lp, _ = self.baseline_agent.select_action(
+                    engine, player_idx, deterministic=True)
+                sl_log_prob = sl_lp
+            except Exception:
+                pass  # agent 可能不支持 baseline KL（如 OracleTeacher）
 
-        return action_idx, log_prob.item(), value, sl_log_prob
+        return action_idx, log_prob, value, sl_log_prob
 
     def _action_from_index(self, action_idx: int, actor: int,
                             legal: LegalActions) -> Action:
@@ -200,9 +224,10 @@ class SelfPlayEnv:
         max_steps = 2000
 
         # 推理时使用 eval 模式：BatchNorm 用 running stats，单样本推理稳定
-        model_was_training = self.model.training
+        model_was_training = self.model.training if self.model else False
         bl_was_training = self.baseline_model.training if self.baseline_model else False
-        self.model.eval()
+        if self.model:
+            self.model.eval()
         if self.baseline_model:
             self.baseline_model.eval()
 
@@ -313,9 +338,9 @@ class SelfPlayEnv:
         # 不再额外施加排名奖励以保持 reward 信号密度均匀。
 
         # 恢复模型训练模式
-        if model_was_training:
+        if model_was_training and self.model:
             self.model.train()
-        if bl_was_training:
+        if bl_was_training and self.baseline_model:
             self.baseline_model.train()
 
         # 标记最后一步为 done
@@ -329,9 +354,11 @@ def run_games(model: MahjongPolicyValueNet,
               num_games: int,
               device: str = 'cpu',
               base_seed: int = 0,
-              deterministic: bool = False) -> List[GameTrajectory]:
+              deterministic: bool = False,
+              agent: Optional[Agent] = None) -> List[GameTrajectory]:
     """批量运行自对弈，返回轨迹列表。"""
-    env = SelfPlayEnv(model, device=device, deterministic=deterministic)
+    env = SelfPlayEnv(model=model, agent=agent, device=device,
+                      deterministic=deterministic)
     trajectories = []
     for i in range(num_games):
         seed = base_seed + i if base_seed > 0 else None

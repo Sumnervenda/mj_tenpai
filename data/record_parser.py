@@ -1,6 +1,7 @@
 """JSONL 对局记录解析器 —— 从 engine 输出的 JSONL 记录中提取 (state, mask, action) 训练样本。"""
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, List, Optional
@@ -159,4 +160,150 @@ class JSONLRecordParser:
             return state
         except Exception:
             return None
+
+
+class OracleTrajectoryJSONLParser:
+    """解析 selfplay_recorder 输出的 Oracle 轨迹 JSONL。
+
+    每行是一个 OracleStep dict（public/private token IDs、action_mask、chosen_action 等）。
+    跳过 type='game_summary' 行。
+
+    输出 9-tuple 样本供 collate_transformer_batch 使用：
+    (token_ids, token_types, behavior_ids, action_mask, label,
+     priv_token_ids, priv_token_types, priv_behavior_ids, reward)
+    """
+
+    def parse_file(self, filepath: str):
+        """逐行生成 9-tuple (token_ids, token_types, behavior_ids, action_mask, label,
+                      priv_token_ids, priv_token_types, priv_behavior_ids, reward)。
+
+        Raises:
+            ValueError: 当样本 schema 不合法时（action_mask 长度、chosen_action 范围、
+                        字段长度不一致等），包含文件路径和行号。
+        """
+        import json
+        from pathlib import Path
+        with Path(filepath).open('r', encoding='utf-8') as f:
+            for line_no, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                # 跳过 game_summary 行
+                if record.get('type') == 'game_summary':
+                    continue
+                # 跳过没有 token 数据的行（heuristic fallback 产出空 token）
+                pub_ids = record.get('public_token_ids', [])
+                if not pub_ids:
+                    continue
+
+                action_mask = record.get('action_mask', [])
+                if not action_mask:
+                    continue
+
+                # ── schema 校验 ──────────────────────────────────────────
+                chosen = record.get('chosen_action', 76)
+
+                # action_mask 长度必须为 77
+                if len(action_mask) != 77:
+                    raise ValueError(
+                        f"{filepath}:{line_no}: action_mask length "
+                        f"{len(action_mask)} != 77")
+                # chosen_action 必须在 [0, 77) 内
+                if not (0 <= chosen < 77):
+                    raise ValueError(
+                        f"{filepath}:{line_no}: chosen_action={chosen} "
+                        f"out of range [0, 77)")
+                # action_mask 至少有一个合法动作
+                if sum(action_mask) <= 0:
+                    raise ValueError(
+                        f"{filepath}:{line_no}: action_mask has no legal actions")
+                # chosen_action 必须在合法掩码内
+                if action_mask[chosen] <= 0:
+                    raise ValueError(
+                        f"{filepath}:{line_no}: chosen_action={chosen} "
+                        f"is illegal (action_mask[{chosen}]=0)")
+                # action_mask 值必须为 0 或 1（二值），且不能含 NaN/Inf
+                for idx, v in enumerate(action_mask):
+                    if not math.isfinite(v):
+                        raise ValueError(
+                            f"{filepath}:{line_no}: action_mask[{idx}] "
+                            f"is not finite ({v})")
+                    if v not in (0.0, 1.0):
+                        raise ValueError(
+                            f"{filepath}:{line_no}: action_mask[{idx}] "
+                            f"={v} is not binary (must be 0 or 1)")
+
+                # Oracle 样本必须有 private tokens
+                priv_ids = record.get('private_token_ids', [])
+                if not priv_ids:
+                    continue
+
+                priv_types = record.get('private_token_types', [])
+                priv_bids = record.get('private_behavior_ids', [])
+                pub_types = record.get('public_token_types', [])
+                pub_bids = record.get('public_behavior_ids', [])
+
+                # public 三组字段长度必须一致
+                if not (len(pub_ids) == len(pub_types) == len(pub_bids)):
+                    raise ValueError(
+                        f"{filepath}:{line_no}: public field length mismatch: "
+                        f"ids={len(pub_ids)}, types={len(pub_types)}, "
+                        f"bids={len(pub_bids)}")
+                # private 三组字段长度必须一致
+                if not (len(priv_ids) == len(priv_types) == len(priv_bids)):
+                    raise ValueError(
+                        f"{filepath}:{line_no}: private field length mismatch: "
+                        f"ids={len(priv_ids)}, types={len(priv_types)}, "
+                        f"bids={len(priv_bids)}")
+
+                # token ID 范围：token_id >= 0, token_type >= 0, behavior_id >= 0
+                for i, tid in enumerate(pub_ids):
+                    if tid < 0:
+                        raise ValueError(
+                            f"{filepath}:{line_no}: public_token_ids[{i}] "
+                            f"={tid} < 0")
+                for i, tt in enumerate(pub_types):
+                    if tt < 0:
+                        raise ValueError(
+                            f"{filepath}:{line_no}: public_token_types[{i}] "
+                            f"={tt} < 0")
+                for i, bid in enumerate(pub_bids):
+                    if bid < 0 or bid >= 64:
+                        raise ValueError(
+                            f"{filepath}:{line_no}: public_behavior_ids[{i}] "
+                            f"={bid} out of range [0, 64)")
+                for i, tid in enumerate(priv_ids):
+                    if tid < 0:
+                        raise ValueError(
+                            f"{filepath}:{line_no}: private_token_ids[{i}] "
+                            f"={tid} < 0")
+                for i, tt in enumerate(priv_types):
+                    if tt < 0:
+                        raise ValueError(
+                            f"{filepath}:{line_no}: private_token_types[{i}] "
+                            f"={tt} < 0")
+                for i, bid in enumerate(priv_bids):
+                    if bid < 0 or bid >= 64:
+                        raise ValueError(
+                            f"{filepath}:{line_no}: private_behavior_ids[{i}] "
+                            f"={bid} out of range [0, 64)")
+
+                reward = record.get('reward', 0.0)
+                # reward 必须有限（不允许 NaN / ±Inf）
+                if not math.isfinite(reward):
+                    raise ValueError(
+                        f"{filepath}:{line_no}: reward={reward} is not finite")
+
+                yield (
+                    np.array(pub_ids, dtype=np.int64),
+                    np.array(pub_types, dtype=np.int64),
+                    np.array(pub_bids, dtype=np.int64),
+                    np.array(action_mask, dtype=np.float32),
+                    np.int64(chosen),
+                    np.array(priv_ids, dtype=np.int64),
+                    np.array(priv_types, dtype=np.int64),
+                    np.array(priv_bids, dtype=np.int64),
+                    np.float32(reward),
+                )
 # 中文注释：定义通用训练样本结构，并解析 JSONL 记录为模型可训练的张量样本。

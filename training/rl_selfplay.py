@@ -21,6 +21,8 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from models import MahjongPolicyValueNet, load_checkpoint, save_checkpoint
+from models.model_io import load_checkpoint_metadata
+from .agents import Agent, ResNetAgent, TransformerAgent, build_agent
 from .selfplay_env import SelfPlayEnv, run_games
 from .ppo_agent import PPOAgent
 from .reward_shaper import load_shaper_from_config
@@ -31,6 +33,9 @@ def parse_args():
         description='RL Self-Play Training for Mahjong AI')
     parser.add_argument('--base_model', type=str, required=True,
                         help='Path to SL pretrained base model checkpoint')
+    parser.add_argument('--model_arch', type=str, default='resnet',
+                        choices=['resnet', 'transformer'],
+                        help='Model architecture (auto-detected from checkpoint if not specified)')
     parser.add_argument('--personality', type=str,
                         default='configs/train_default.yaml',
                         help='Path to personality YAML config')
@@ -89,20 +94,30 @@ def load_training_config(config_path: str) -> dict:
     return cfg
 
 
-def run_eval(model: MahjongPolicyValueNet, num_games: int,
+def run_eval(model: Optional[MahjongPolicyValueNet],
+             num_games: int,
              device: str,
-             baseline_model: MahjongPolicyValueNet | None = None,
-             trainee_idx: int = 0) -> dict:
+             baseline_model: Optional[MahjongPolicyValueNet] = None,
+             trainee_idx: int = 0,
+             agent: Optional[Agent] = None,
+             baseline_agent: Optional[Agent] = None) -> dict:
     """运行评估：trainee vs frozen baseline，只统计 trainee 的指标。
 
-    当 baseline_model 为 None 时回退到旧行为（同一模型四家），
+    当 baseline_model/agent 为 None 时回退到旧行为（同一模型四家），
     返回所有座位的多玩家指标。
     """
-    env = SelfPlayEnv(model, device=device, deterministic=True,
+    env = SelfPlayEnv(model=model, agent=agent, device=device,
+                      deterministic=True,
                       baseline_model=baseline_model,
+                      baseline_agent=baseline_agent,
                       trainee_idx=trainee_idx)
-    model.eval()
-    if baseline_model is not None:
+    if agent is not None and hasattr(agent, 'model'):
+        agent.model.eval()
+    elif model is not None:
+        model.eval()
+    if baseline_agent is not None and hasattr(baseline_agent, 'model'):
+        baseline_agent.model.eval()
+    elif baseline_model is not None:
         baseline_model.eval()
     all_ranks = {p: [] for p in range(4)}
     all_scores = {p: [] for p in range(4)}
@@ -164,9 +179,26 @@ def main():
             print(f"Warning: Could not load reward shaper: {e}")
 
     # 加载 SL 预训练模型
-    model = MahjongPolicyValueNet()
-    epoch, meta = load_checkpoint(model, args.base_model, device=device)
-    print(f"Loaded base model from {args.base_model} (epoch {epoch})")
+    # 自动从 checkpoint metadata 推断模型架构（只读 metadata，不加载权重）
+    resume_meta = load_checkpoint_metadata(args.base_model)
+    ckpt_arch = resume_meta.get('model_arch', args.model_arch)
+    if ckpt_arch != args.model_arch:
+        print(f"Auto-detected model_arch={ckpt_arch} from checkpoint metadata")
+        args.model_arch = ckpt_arch
+
+    if args.model_arch == 'transformer':
+        raise ValueError(
+            '--model_arch transformer is not yet supported for PPO training. '
+            'PPOAgent.update() requires ResNet-style (state, mask) tensors; '
+            'Transformer PPO needs token-based rollout and TransformerPPOAgent. '
+            'Use --model_arch resnet for RL training, or '
+            'use training.selfplay_recorder to generate oracle trajectories '
+            'for teacher training instead.')
+    else:
+        model = MahjongPolicyValueNet()
+        epoch, meta = load_checkpoint(model, args.base_model, device=device)
+        model = model.to(device)
+        print(f"Loaded ResNet base model (epoch {epoch})")
     if meta:
         print(f"  Checkpoint metadata: {meta.get('val_acc', 'N/A')}")
 
@@ -174,19 +206,25 @@ def main():
         model = torch.compile(model, mode='reduce-overhead')
         print("Model compiled with torch.compile")
 
-    # 加载 frozen SL baseline（对手模型，不参与训练）
+    # 构造 trainee agent
+    trainee_agent = build_agent(args.model_arch, model, device=device,
+                                checkpoint_metadata=resume_meta)
+
+    # 加载 frozen SL baseline（对手 agent，不参与训练）
     baseline_model = MahjongPolicyValueNet()
     _, _ = load_checkpoint(baseline_model, args.base_model, device=device)
     baseline_model = baseline_model.to(device)
     baseline_model.eval()
     for p in baseline_model.parameters():
         p.requires_grad_(False)
-    print(f"Loaded frozen baseline from {args.base_model}")
+    baseline_agent = build_agent(args.model_arch, baseline_model, device=device,
+                                 checkpoint_metadata=resume_meta)
+    print(f"Loaded frozen baseline ({args.model_arch}) from {args.base_model}")
 
     trainee_idx = 0  # trainee 固定坐 P0
 
-    # 初始化 PPO Agent
-    agent = PPOAgent(
+    # 初始化 PPO Agent（PPO 内部仍使用裸模型做梯度更新）
+    ppo_agent = PPOAgent(
         model=model,
         device=device,
         lr=train_cfg.get('lr', 3e-4),
@@ -200,11 +238,11 @@ def main():
         kl_coef=train_cfg.get('kl_coef', 0.01),
     )
 
-    # 自对弈环境：trainee 用训练模型 + reward_shaper，对手用 frozen baseline
-    env = SelfPlayEnv(model, device=device, deterministic=False,
+    # 自对弈环境：trainee 用训练 agent + reward_shaper，对手用 frozen baseline
+    env = SelfPlayEnv(agent=trainee_agent, device=device, deterministic=False,
                       reward_shaper=reward_shaper,
                       trainee_idx=trainee_idx,
-                      baseline_model=baseline_model)
+                      baseline_agent=baseline_agent)
 
     Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
     total_env_steps = 0
@@ -252,16 +290,16 @@ def main():
         iteration += 1
 
         # 收集 rollout
-        agent.clear_buffer()
+        ppo_agent.clear_buffer()
         for g in range(args.rollout_games):
             seed = args.seed + iteration * 1000 + g
             traj = env.run_game(seed=seed)
 
-            agent.collect_trajectories([traj])
+            ppo_agent.collect_trajectories([traj])
             total_env_steps += traj.total_steps
 
         # PPO 更新
-        metrics = agent.update(
+        metrics = ppo_agent.update(
             ppo_epochs=train_cfg.get('ppo_epochs', 10),
             mini_batch_size=train_cfg.get('mini_batch_size', 1024),
         )
@@ -273,7 +311,9 @@ def main():
         if iteration % args.eval_every == 0:
             eval_metrics = run_eval(model, args.eval_games, device,
                                     baseline_model=baseline_model,
-                                    trainee_idx=trainee_idx)
+                                    trainee_idx=trainee_idx,
+                                    agent=trainee_agent,
+                                    baseline_agent=baseline_agent)
 
         avg_rank = eval_metrics.get('avg_rank', float('inf'))
         fourth_rate = eval_metrics.get('fourth_rate', 0)
@@ -293,6 +333,7 @@ def main():
                 'total_loss': metrics['total_loss'],
                 'total_steps': total_env_steps,
                 'iteration': iteration,
+                'model_arch': args.model_arch,
             }
             if eval_metrics:
                 log_data['eval/avg_rank'] = avg_rank
@@ -313,33 +354,38 @@ def main():
         # 保存最佳模型（按 avg_rank，越低越好）
         if avg_rank < best_avg_rank:
             best_avg_rank = avg_rank
-            agent.save_checkpoint(
+            ppo_agent.save_checkpoint(
                 os.path.join(args.checkpoint_dir, 'rl_best.pt'),
                 iteration,
                 metadata={'eval_avg_rank': avg_rank,
                           'eval_fourth_rate': fourth_rate,
-                          'personality': args.personality},
+                          'personality': args.personality,
+                          'model_arch': args.model_arch},
             )
 
         # 定期保存
         if iteration % args.checkpoint_every == 0:
-            agent.save_checkpoint(
+            ppo_agent.save_checkpoint(
                 os.path.join(args.checkpoint_dir, f'rl_iter_{iteration:04d}.pt'),
                 iteration,
-                metadata={'iteration': iteration, 'total_steps': total_env_steps},
+                metadata={'iteration': iteration, 'total_steps': total_env_steps,
+                          'model_arch': args.model_arch},
             )
 
     # 最终保存
-    agent.save_checkpoint(
+    ppo_agent.save_checkpoint(
         os.path.join(args.checkpoint_dir, 'rl_final.pt'),
         iteration,
-        metadata={'history': history, 'total_steps': total_env_steps},
+        metadata={'history': history, 'total_steps': total_env_steps,
+                  'model_arch': args.model_arch},
     )
 
     # 最终评估
     final_eval = run_eval(model, args.eval_games * 2, device,
                           baseline_model=baseline_model,
-                          trainee_idx=trainee_idx)
+                          trainee_idx=trainee_idx,
+                          agent=trainee_agent,
+                          baseline_agent=baseline_agent)
     print(f"\nFinal evaluation ({args.eval_games * 2} games):")
     print(f"  Trainee P{trainee_idx}: WR={final_eval['win_rate']:.1%} "
           f"AvgRank={final_eval['avg_rank']:.2f} "

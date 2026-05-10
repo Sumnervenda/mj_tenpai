@@ -2,9 +2,20 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
-[![Tests](https://img.shields.io/badge/tests-172%20passed-brightgreen.svg)](.)
+[![Tests](https://img.shields.io/badge/tests-220%20passed-brightgreen.svg)](.)
 
 基于 PyTorch 的立直麻将 AI 训练框架，包含完整的日麻规则引擎、两种神经网络架构（ResNet1D 基线 + Transformer MTL）、监督学习与强化学习训练流水线。
+
+## 当前训练状态
+
+| 架构 | 流水线状态 | 备注 |
+|------|-----------|------|
+| **ResNet1D** | 已接入完整 SL/RL 训练流水线 | 主训练架构 |
+| **Transformer MTL** | SL 训练流水线已集成，断点续训已支持 | 主训练架构 |
+
+Transformer MTL 进度：
+- 已完成：Tokenizer、Backbone、MTL Heads（6头）、Oracle 标签（shanten/ukeire）、SL 训练入口（`--model_arch transformer`）、断点续训（`--resume`）、wandb 集成、Teacher-Student 蒸馏
+- 开发中：Danger/Score head 标签、RL fine-tuning
 
 ---
 
@@ -198,6 +209,99 @@ python -m training.iterative_rl \
 
 ---
 
+## 云服务器训练
+
+### 一键配置
+
+```bash
+# 克隆仓库
+git clone git@github.com:Sumnervenda/mj_tenpai.git
+cd mj_tenpai
+
+# 一键配置（自动检测 GPU、安装 PyTorch + CUDA、验证环境）
+chmod +x setup_server.sh && ./setup_server.sh
+```
+
+### 手动配置
+
+```bash
+# 1. 创建虚拟环境
+python3 -m venv .venv && source .venv/bin/activate
+
+# 2. 安装 PyTorch（根据 CUDA 版本选择）
+pip install torch --index-url https://download.pytorch.org/whl/cu124  # CUDA 12.4
+# pip install torch --index-url https://download.pytorch.org/whl/cu118  # CUDA 11.8
+
+# 3. 安装依赖
+pip install -r requirements.txt
+
+# 4. 验证
+python -c "import torch; print(torch.cuda.is_available())"
+```
+
+### 上传数据集
+
+数据集 (`dataset/datasets_years/`) 未包含在 git 中，需单独上传：
+
+```bash
+# 从本地上传到服务器
+scp -r dataset/datasets_years/ user@server:~/mj_tenpai/dataset/
+
+# 或使用 rsync（支持断点续传）
+rsync -avz --progress dataset/datasets_years/ user@server:~/mj_tenpai/dataset/datasets_years/
+```
+
+### 训练命令
+
+```bash
+# Transformer SL 预训练（2021-2026 数据，batch_size=256 适配 16GB 显存）
+python -m training.sl_pretrain \
+    --data_format mjson \
+    --random_split_all_mjson dataset/datasets_years \
+    --mjson_years '2021,2022,2023,2024,2025,2026' \
+    --stream_mjson \
+    --model_arch transformer \
+    --epochs 10 --batch_size 256 --lr 3e-4 \
+    --save_every 2 --wandb \
+    --wandb_project mahjong-dl \
+    --wandb_name transformer_sl_server \
+    --checkpoint_dir checkpoints/transformer_server \
+    --device cuda
+
+# 从断点续训（自动恢复 model/optimizer/scheduler/RNG 状态）
+python -m training.sl_pretrain \
+    --resume checkpoints/transformer_server/sl_resume.pt \
+    --data_format mjson \
+    --random_split_all_mjson dataset/datasets_years \
+    --mjson_years '2021,2022,2023,2024,2025,2026' \
+    --stream_mjson \
+    --model_arch transformer \
+    --epochs 10 --batch_size 256 --lr 3e-4 \
+    --save_every 2 --wandb \
+    --checkpoint_dir checkpoints/transformer_server \
+    --device cuda
+```
+
+### tmux 后台训练（推荐）
+
+```bash
+tmux new -s train                    # 创建 session
+# 执行训练命令...
+# Ctrl+B, D                          # 断开（训练继续运行）
+tmux attach -t train                 # 重新连接
+```
+
+### Checkpoint 说明
+
+| 文件 | 保存时机 | 内容 |
+|------|---------|------|
+| `sl_resume.pt` | 每个 epoch 结束 | 完整续训状态（model + optimizer + scheduler + scaler + RNG） |
+| `sl_best.pt` | val accuracy 创新高 | 完整续训状态 + best_val_acc |
+| `sl_epoch_NNN.pt` | 每 `--save_every` 个 epoch | 完整续训状态 |
+| `sl_final.pt` | 训练结束 | 完整续训状态 + test 评估结果 |
+
+---
+
 ## Oracle 算法
 
 `data/oracle.py` 为 MTL 模型生成监督标签：
@@ -211,13 +315,14 @@ python -m training.iterative_rl \
 ## 依赖
 
 ```
-torch >= 2.0
-numpy
-pytest
-pyyaml
+torch >= 2.0 (CUDA 12.x 推荐)
+numpy >= 1.24
+pyyaml >= 6.0
+wandb >= 0.17
+orjson >= 3.10
 ```
 
-可选（W&B 日志）：`wandb`
+开发依赖：`pytest >= 7.0`（见 `requirements-dev.txt`）
 
 ---
 

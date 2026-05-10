@@ -1,7 +1,7 @@
 """PyTorch Dataset —— 包装训练样本供 DataLoader 使用。"""
 
 import math
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -115,6 +115,153 @@ class MJSONIterableDataset(IterableDataset):
         return len(self.file_paths)
 
 
+class MJSONTokenIterableDataset(IterableDataset):
+    """按文件流式解析 MJSON，输出 token 序列样本（Transformer 训练用）。
+
+    每个样本为 (token_ids, token_types, behavior_ids, action_mask, label)，
+    配合 collate_transformer_batch 使用。
+    """
+
+    def __init__(self,
+                 file_paths: Sequence[str],
+                 shuffle_files: bool = False,
+                 seed: int = 42,
+                 parser_verbose: bool = False):
+        super().__init__()
+        self.file_paths = [str(p) for p in file_paths]
+        self.shuffle_files = shuffle_files
+        self.seed = seed
+        self.epoch = 0
+        self.parser_verbose = parser_verbose
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __iter__(self):
+        from .mjson_parser import MJSONRecordParser
+        parser = MJSONRecordParser(verbose=self.parser_verbose)
+        file_paths = list(self.file_paths)
+
+        if self.shuffle_files:
+            rng = np.random.default_rng(self.seed + self.epoch)
+            rng.shuffle(file_paths)
+
+        worker = get_worker_info()
+        if worker is not None:
+            file_paths = file_paths[worker.id::worker.num_workers]
+
+        for fp in file_paths:
+            for token_ids, token_types, behavior_ids, \
+                    action_mask, label in parser.parse_file_token_samples(fp):
+                yield (
+                    np.array(token_ids, dtype=np.int64),
+                    np.array(token_types, dtype=np.int64),
+                    np.array(behavior_ids, dtype=np.int64),
+                    action_mask,
+                    np.int64(label),
+                )
+
+    def __len__(self) -> int:
+        return len(self.file_paths)
+
+
+class MJSONPublicPrivateTokenIterableDataset(IterableDataset):
+    """按文件流式解析 MJSON，输出 public + private token 序列样本（Teacher 训练用）。
+
+    每个样本为 8-tuple:
+    (token_ids, token_types, behavior_ids, action_mask, label,
+     priv_token_ids, priv_token_types, priv_behavior_ids)
+    配合 collate_transformer_batch 使用。
+    """
+
+    def __init__(self,
+                 file_paths: Sequence[str],
+                 shuffle_files: bool = False,
+                 seed: int = 42,
+                 parser_verbose: bool = False):
+        super().__init__()
+        self.file_paths = [str(p) for p in file_paths]
+        self.shuffle_files = shuffle_files
+        self.seed = seed
+        self.epoch = 0
+        self.parser_verbose = parser_verbose
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __iter__(self):
+        from .mjson_parser import MJSONRecordParser
+        parser = MJSONRecordParser(verbose=self.parser_verbose)
+        file_paths = list(self.file_paths)
+
+        if self.shuffle_files:
+            rng = np.random.default_rng(self.seed + self.epoch)
+            rng.shuffle(file_paths)
+
+        worker = get_worker_info()
+        if worker is not None:
+            file_paths = file_paths[worker.id::worker.num_workers]
+
+        for fp in file_paths:
+            for (token_ids, token_types, behavior_ids,
+                 action_mask, label,
+                 priv_ids, priv_types, priv_bids) in \
+                    parser.parse_file_public_private_token_samples(fp):
+                yield (
+                    np.array(token_ids, dtype=np.int64),
+                    np.array(token_types, dtype=np.int64),
+                    np.array(behavior_ids, dtype=np.int64),
+                    action_mask,
+                    np.int64(label),
+                    np.array(priv_ids, dtype=np.int64),
+                    np.array(priv_types, dtype=np.int64),
+                    np.array(priv_bids, dtype=np.int64),
+                )
+
+    def __len__(self) -> int:
+        return len(self.file_paths)
+
+
+class OracleTrajectoryIterableDataset(IterableDataset):
+    """流式读取 selfplay_recorder 输出的 Oracle 轨迹 JSONL。
+
+    每个样本为 8-tuple（public + private token fields），
+    配合 collate_transformer_batch 使用。
+    """
+
+    def __init__(self,
+                 file_paths: Sequence[str],
+                 shuffle_files: bool = False,
+                 seed: int = 42):
+        super().__init__()
+        self.file_paths = [str(p) for p in file_paths]
+        self.shuffle_files = shuffle_files
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __iter__(self):
+        from .record_parser import OracleTrajectoryJSONLParser
+        parser = OracleTrajectoryJSONLParser()
+        file_paths = list(self.file_paths)
+
+        if self.shuffle_files:
+            rng = np.random.default_rng(self.seed + self.epoch)
+            rng.shuffle(file_paths)
+
+        worker = get_worker_info()
+        if worker is not None:
+            file_paths = file_paths[worker.id::worker.num_workers]
+
+        for fp in file_paths:
+            yield from parser.parse_file(fp)
+
+    def __len__(self) -> int:
+        return len(self.file_paths)
+
+
 class TensorShardBatchDataset(IterableDataset):
     """Stream pre-batched tensor shards produced by training.mjson_cache."""
 
@@ -185,3 +332,143 @@ class TensorShardBatchDataset(IterableDataset):
             return self.total_samples // self.batch_size
         return math.ceil(self.total_samples / self.batch_size)
 # 中文注释：PyTorch 数据集封装，连接牌谱解析结果和监督学习 DataLoader。
+
+
+# ── Transformer Token Dataset ─────────────────────────────────────────────────
+
+class TokenDataset(Dataset):
+    """Transformer 训练用的 Token 序列数据集。
+
+    每个样本包含已 tokenize 的序列和对应的标签。
+
+    Args:
+        token_ids: List[List[int]] 变长 token ID 序列
+        token_types: List[List[int]] 变长 token 类型序列
+        behavior_ids: List[List[int]] 变长 behavior ID 序列
+        action_mask: np.ndarray (N, 77) 合法动作掩码
+        labels: np.ndarray (N,) 目标动作索引
+        oracle_shanten: Optional[np.ndarray] (N,) 向听标签
+        oracle_ukeire_mask: Optional[np.ndarray] (N, 34) 进张掩码标签
+    """
+
+    def __init__(self,
+                 token_ids: List[List[int]],
+                 token_types: List[List[int]],
+                 behavior_ids: List[List[int]],
+                 action_mask: np.ndarray,
+                 labels: np.ndarray,
+                 oracle_shanten: Optional[np.ndarray] = None,
+                 oracle_ukeire_mask: Optional[np.ndarray] = None):
+        self.token_ids = token_ids
+        self.token_types = token_types
+        self.behavior_ids = behavior_ids
+        self.action_mask = torch.FloatTensor(
+            action_mask.astype(np.float32))
+        self.labels = torch.LongTensor(labels.astype(np.int64))
+        self.oracle_shanten = (torch.LongTensor(oracle_shanten.astype(np.int64))
+                               if oracle_shanten is not None else None)
+        self.oracle_ukeire_mask = (torch.FloatTensor(
+            oracle_ukeire_mask.astype(np.float32))
+            if oracle_ukeire_mask is not None else None)
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def __getitem__(self, idx: int):
+        item = (
+            torch.LongTensor(self.token_ids[idx]),
+            torch.LongTensor(self.token_types[idx]),
+            torch.LongTensor(self.behavior_ids[idx]),
+            self.action_mask[idx],
+            self.labels[idx],
+        )
+        if self.oracle_shanten is not None:
+            item += (self.oracle_shanten[idx],)
+        if self.oracle_ukeire_mask is not None:
+            item += (self.oracle_ukeire_mask[idx],)
+        return item
+
+
+def collate_transformer_batch(
+        batch: List[Tuple[torch.Tensor, ...]]) -> Dict[str, torch.Tensor]:
+    """将变长 Token 序列列表组装为 padded batch。
+
+    序列用 PAD=0 填充，attention_mask 中 True=padding。
+
+    支持以下 tuple 长度：
+    - 5: (token_ids, token_types, behavior_ids, action_mask, label)
+    - 6: + oracle_shanten
+    - 7: + oracle_ukeire_mask
+    - 8: + priv_token_ids, priv_token_types, priv_behavior_ids  (teacher mode)
+
+    Returns:
+        dict with keys: token_ids, token_types, behavior_ids,
+            attention_mask, action_mask, labels,
+            and optionally oracle_shanten, oracle_ukeire_mask,
+            private_token_ids, private_token_types, private_behavior_ids,
+            private_attention_mask
+    """
+    tuple_len = len(batch[0])
+    has_private = tuple_len >= 8
+    has_reward = tuple_len >= 9
+    has_shanten = tuple_len >= 6 and not has_private
+    has_ukeire = tuple_len >= 7 and not has_private
+
+    B = len(batch)
+    max_len = max(item[0].shape[0] for item in batch)
+
+    token_ids = torch.zeros(B, max_len, dtype=torch.long)
+    token_types = torch.zeros(B, max_len, dtype=torch.long)
+    behavior_ids = torch.zeros(B, max_len, dtype=torch.long)
+    attention_mask = torch.ones(B, max_len, dtype=torch.bool)
+
+    action_mask = torch.stack([torch.as_tensor(item[3]) for item in batch])
+    labels = torch.stack([torch.as_tensor(item[4]) for item in batch])
+
+    for i, item in enumerate(batch):
+        L = item[0].shape[0]
+        token_ids[i, :L] = torch.as_tensor(item[0])
+        token_types[i, :L] = torch.as_tensor(item[1])
+        behavior_ids[i, :L] = torch.as_tensor(item[2])
+        attention_mask[i, :L] = False
+
+    result = {
+        'token_ids': token_ids,
+        'token_types': token_types,
+        'behavior_ids': behavior_ids,
+        'attention_mask': attention_mask,
+        'action_mask': action_mask,
+        'labels': labels,
+    }
+
+    if has_shanten:
+        result['oracle_shanten'] = torch.stack(
+            [torch.as_tensor(item[5]) for item in batch])
+    if has_ukeire:
+        idx = 6 if has_shanten else 5
+        result['oracle_ukeire_mask'] = torch.stack(
+            [torch.as_tensor(item[idx]) for item in batch])
+
+    # Private tokens for teacher mode (8-tuple)
+    if has_private:
+        max_priv_len = max(item[5].shape[0] for item in batch)
+        priv_ids = torch.zeros(B, max_priv_len, dtype=torch.long)
+        priv_types = torch.zeros(B, max_priv_len, dtype=torch.long)
+        priv_bids = torch.zeros(B, max_priv_len, dtype=torch.long)
+        priv_attn = torch.ones(B, max_priv_len, dtype=torch.bool)
+        for i, item in enumerate(batch):
+            L = item[5].shape[0]
+            priv_ids[i, :L] = torch.as_tensor(item[5])
+            priv_types[i, :L] = torch.as_tensor(item[6])
+            priv_bids[i, :L] = torch.as_tensor(item[7])
+            priv_attn[i, :L] = False
+        result['private_token_ids'] = priv_ids
+        result['private_token_types'] = priv_types
+        result['private_behavior_ids'] = priv_bids
+        result['private_attention_mask'] = priv_attn
+
+    if has_reward:
+        result['rewards'] = torch.stack(
+            [torch.as_tensor(item[8]) for item in batch])
+
+    return result

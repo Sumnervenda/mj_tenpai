@@ -50,12 +50,13 @@ class TestTokenizerConstruction:
     """Test basic tokenizer construction and vocabulary."""
 
     def test_vocab_constants(self):
-        assert TokenVocab.VOCAB_SIZE == 128
-        assert TokenVocab.TILE_MIN == 0
-        assert TokenVocab.TILE_MAX == 33
-        assert TokenVocab.RED_5M == 34
-        assert TokenVocab.ACTION_TSUMOGIRI == 41
-        assert TokenVocab.ROUND_EAST == 54
+        assert TokenVocab.VOCAB_SIZE == 192
+        assert TokenVocab.PAD == 0
+        assert TokenVocab.TILE_MIN == 1
+        assert TokenVocab.TILE_MAX == 34
+        assert TokenVocab.RED_5M == 35
+        assert TokenVocab.ACTION_TSUMOGIRI == 42
+        assert TokenVocab.ROUND_EAST == 55
 
     def test_token_type_constants(self):
         assert TokenType.HAND == 0
@@ -96,8 +97,8 @@ class TestTokenizerHand:
 
         hand_ids = [t.token_id for t in seq.tokens
                     if t.token_type == TokenType.HAND]
-        # Expected: 0,1,2 (123m), 15,16,17 (789p), 18,19,20 (123s), 27,27 (EE), 31 (P), 32 (F)
-        expected = [0, 1, 2, 15, 16, 17, 18, 19, 20, 27, 27, 31, 32]
+        # Expected: tile types 0,1,2,15,16,17,18,19,20,27,27,31,32 → +1 shift
+        expected = [1, 2, 3, 16, 17, 18, 19, 20, 21, 28, 28, 32, 33]
         assert sorted(hand_ids) == sorted(expected), f"{sorted(hand_ids)} != {sorted(expected)}"
 
 
@@ -111,7 +112,7 @@ class TestTokenizerDora:
 
         dora_tokens = [t for t in seq.tokens if t.token_type == TokenType.DORA]
         assert len(dora_tokens) == 1
-        assert dora_tokens[0].token_id == 0  # 1m dora indicator
+        assert dora_tokens[0].token_id == 1  # 1m dora indicator (0 → +1)
 
 
 class TestTokenizerDiscard:
@@ -135,9 +136,12 @@ class TestTokenizerDiscard:
         discard_tokens = [t for t in seq.tokens
                           if t.token_type == TokenType.DISCARD]
         for t in discard_tokens:
-            assert t.behavior_id > 0, "Discard tokens should have behavior_id"
-            player = (t.behavior_id >> 8) & 0xFF
+            # behavior_id = player * 4 + action_offset (TEDASHI=0)
+            # P0 → 0, P1 → 4
+            player = t.behavior_id // 4
             assert player in (0, 1)
+            assert t.behavior_id < 64, \
+                f"behavior_id {t.behavior_id} exceeds num_behavior_types"
 
 
 class TestTokenizerMeld:

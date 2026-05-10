@@ -13,13 +13,17 @@
   - attention_mask: (B, S) — bool, True=padding
   - action_mask:  (B, 77) — 合法动作掩码
 
-输出:
+输出（Student 模式）:
   - policy_logits: (B, 77)
   - value: (B, 1)
   - shanten: (B, 7)
   - efficiency: (B, 3)
   - danger: (B, 34)
   - score_value: (B, 1)
+
+输出（Teacher 模式，额外）:
+  - oracle_value: (B, 1) — 上帝视角价值
+  - teacher_policy_logits: (B, 77) — 教师策略（用于蒸馏）
 """
 
 from __future__ import annotations
@@ -58,6 +62,7 @@ class TransformerPolicyValueNet(nn.Module):
                  num_behavior_types: int = 64,
                  d_model: int = 256,
                  n_concept: int = 10,
+                 n_private_concept: int = 4,
                  n_layers: int = 6,
                  n_heads: int = 8,
                  d_ff: int = 1024,
@@ -79,9 +84,11 @@ class TransformerPolicyValueNet(nn.Module):
         self.embed_norm = nn.LayerNorm(d_model)
         self.embed_dropout = nn.Dropout(dropout)
 
-        # Concept Tokens (Semantic Bottleneck)
+        # Concept Tokens (Semantic Bottleneck) — public + private
         self.concept_tokens = nn.Parameter(
             torch.randn(n_concept, d_model) * 0.02)
+        self.private_concept_tokens = nn.Parameter(
+            torch.randn(n_private_concept, d_model) * 0.02)
 
         # Transformer Backbone
         self.backbone = TransformerBackbone(
@@ -99,6 +106,7 @@ class TransformerPolicyValueNet(nn.Module):
         # Save config
         self.d_model = d_model
         self.n_concept = n_concept
+        self.n_private_concept = n_private_concept
         self.action_dim = action_dim
 
     def forward(self,
@@ -107,24 +115,35 @@ class TransformerPolicyValueNet(nn.Module):
                 behavior_ids: Optional[torch.Tensor] = None,
                 attention_mask: Optional[torch.Tensor] = None,
                 action_mask: Optional[torch.Tensor] = None,
+                private_token_ids: Optional[torch.Tensor] = None,
+                private_token_types: Optional[torch.Tensor] = None,
+                private_behavior_ids: Optional[torch.Tensor] = None,
+                private_attention_mask: Optional[torch.Tensor] = None,
+                mode: str = "student",
                 ) -> Dict[str, torch.Tensor]:
         """前向传播。
 
         Args:
-            token_ids: (B, S) Token ID
-            token_types: (B, S) Token Type ID
-            behavior_ids: (B, S) Behavior ID, 可选
+            token_ids: (B, S) public Token ID
+            token_types: (B, S) public Token Type ID
+            behavior_ids: (B, S) public Behavior ID, 可选
             attention_mask: (B, S) bool, True=padding
             action_mask: (B, 77) 合法动作掩码
+            private_token_ids: (B, S_priv) private Token ID (teacher mode)
+            private_token_types: (B, S_priv) private Token Type ID
+            private_behavior_ids: (B, S_priv) private Behavior ID
+            private_attention_mask: (B, S_priv) bool
+            mode: "student" | "teacher"
 
         Returns:
-            dict: policy_logits, value, shanten, efficiency, danger, score_value
+            dict: policy_logits, value, shanten, efficiency, danger, score_value,
+                  and in teacher mode: oracle_value
         """
         B, S = token_ids.shape
 
-        # ── Token Embedding ────────────────────────────────────────────
-        x = self.token_embedding(token_ids)               # (B, S, d_model)
-        x = x + self.type_embedding(token_types)           # (B, S, d_model)
+        # ── Public Token Embedding ─────────────────────────────────────
+        x = self.token_embedding(token_ids)
+        x = x + self.type_embedding(token_types)
 
         if behavior_ids is not None:
             x = x + self.behavior_embedding(behavior_ids)
@@ -132,32 +151,71 @@ class TransformerPolicyValueNet(nn.Module):
         x = self.embed_norm(x)
         x = self.embed_dropout(x)
 
-        # ── Prepend Concept Tokens ─────────────────────────────────────
+        # ── Prepend Public Concept Tokens ──────────────────────────────
         concepts = self.concept_tokens.unsqueeze(0).expand(B, -1, -1)
-        # (B, n_concept, d_model)
+        full_seq = torch.cat([x, concepts], dim=1)
 
-        full_seq = torch.cat([x, concepts], dim=1)  # (B, S + n_concept, d_model)
+        # ── Teacher: embed private tokens + private concept ────────────
+        private_concept_out = None
+        has_private = (mode == "teacher" and private_token_ids is not None
+                       and private_token_ids.shape[1] > 0)
+        if has_private:
+            x_priv = self.token_embedding(private_token_ids)
+            x_priv = x_priv + self.type_embedding(private_token_types)
+            if private_behavior_ids is not None:
+                x_priv = x_priv + self.behavior_embedding(private_behavior_ids)
+            x_priv = self.embed_norm(x_priv)
+            x_priv = self.embed_dropout(x_priv)
+
+            priv_concepts = self.private_concept_tokens.unsqueeze(0).expand(
+                B, -1, -1)
+            full_seq = torch.cat([x, x_priv, priv_concepts, concepts], dim=1)
 
         # ── Build combined padding mask ────────────────────────────────
+        full_mask = None
         if attention_mask is not None:
-            # Concept tokens are never padding
             concept_mask = torch.zeros(
                 B, self.n_concept, device=attention_mask.device,
                 dtype=attention_mask.dtype)
-            full_mask = torch.cat([attention_mask, concept_mask], dim=1)
-        else:
-            full_mask = None
+            if has_private:
+                priv_concept_mask = torch.zeros(
+                    B, self.n_private_concept, device=attention_mask.device,
+                    dtype=attention_mask.dtype)
+                priv_mask = (private_attention_mask
+                             if private_attention_mask is not None
+                             else torch.zeros(
+                                 B, private_token_ids.shape[1],
+                                 device=attention_mask.device,
+                                 dtype=attention_mask.dtype))
+                full_mask = torch.cat(
+                    [attention_mask, priv_mask, priv_concept_mask, concept_mask],
+                    dim=1)
+            else:
+                full_mask = torch.cat([attention_mask, concept_mask], dim=1)
 
         # ── Transformer Forward ────────────────────────────────────────
+        total_len = full_seq.size(1)
+        if total_len > self.backbone.max_len:
+            raise RuntimeError(
+                f"Sequence length {total_len} exceeds backbone max_len "
+                f"{self.backbone.max_len}. In teacher mode the total length is "
+                f"public({token_ids.size(1)}) + private({private_token_ids.size(1) if has_private else 0})"
+                f" + public_concepts({self.n_concept})"
+                f" + private_concepts({self.n_private_concept if has_private else 0})."
+                f" Use --max_len {total_len} or higher.")
         hidden = self.backbone(full_seq, mask=full_mask)
-        # (B, S + n_concept, d_model)
 
         # ── Extract Concept Outputs ────────────────────────────────────
         concept_outputs = hidden[:, -self.n_concept:, :]
-        # (B, n_concept, d_model)
+
+        if has_private:
+            # Private concepts are between public concepts and the end
+            priv_start = -(self.n_concept + self.n_private_concept)
+            priv_end = -self.n_concept
+            private_concept_out = hidden[:, priv_start:priv_end, :]
 
         # ── Multi-Task Heads ───────────────────────────────────────────
-        return self.heads(concept_outputs, action_mask)
+        return self.heads(concept_outputs, action_mask, private_concept_out)
 
     def get_action(self,
                    token_ids: torch.Tensor,
@@ -242,16 +300,20 @@ class TransformerPolicyValueNet(nn.Module):
     def compute_diversity_loss(self) -> torch.Tensor:
         """计算 Concept Token 的多样性损失（防 Collapse）。
 
-        鼓励 Concept Token 之间相互区分。
+        鼓励 public + private concept tokens 各自内部保持区分度。
         """
-        # concept_tokens: (n_concept, d_model)
-        normalized = F.normalize(self.concept_tokens, dim=-1)
-        sim = normalized @ normalized.T  # (n_concept, n_concept)
+        def _off_diag_loss(tokens):
+            n = tokens.shape[0]
+            if n < 2:
+                return torch.tensor(0.0, device=tokens.device)
+            normalized = F.normalize(tokens, dim=-1)
+            sim = normalized @ normalized.T
+            mask = ~torch.eye(n, dtype=torch.bool, device=sim.device)
+            return sim[mask].pow(2).mean()
 
-        # 惩罚非对角相似度
-        n = self.n_concept
-        off_diagonal = sim[~torch.eye(n, dtype=torch.bool, device=sim.device)]
-        return off_diagonal.pow(2).mean()
+        loss = _off_diag_loss(self.concept_tokens)
+        loss = loss + _off_diag_loss(self.private_concept_tokens)
+        return loss
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

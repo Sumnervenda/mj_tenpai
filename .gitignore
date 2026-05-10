@@ -27,8 +27,12 @@ dist/
 
 # Temp / logs
 .tmp/
+.tmp_pytest_review/
 wandb/
 *.log
+
+# Scratch / review files
+review.md
 
 # Web artifacts (not part of the training framework)
 console.html

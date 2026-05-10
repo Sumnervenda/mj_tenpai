@@ -56,7 +56,7 @@
 
 \### 3. 神经网络结构 (The Brain: 1D-CNN + ResNet)
 
-为了适配 RTX 4060 Ti 的显存和算力限制，本项目\*\*舍弃 Transformer 架构\*\*，采用高度契合麻将“搭子”逻辑的 \*\*1D-CNN 搭配残差网络 (ResNet)\*\*。
+为了适配 RTX 4060 Ti 的显存和算力限制，本项目以 \*\*1D-CNN 搭配残差网络 (ResNet)\*\* 作为主训练架构。\*\*Transformer MTL\*\* 架构为实验性质，已完成 Tokenizer、Backbone、MTL Heads 和 Oracle 标签，训练流水线仍在开发中。
 
 \*   利用 1D 卷积核在长度为 34 的维度上滑动，高效提取相邻牌的“顺子/面子”关联特征。
 

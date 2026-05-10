@@ -352,10 +352,21 @@ class TestGradientFlow:
         behavior_ids = torch.randint(0, 20, (B, S))
         action_mask = torch.ones(B, 77)
 
+        # Student forward
         outputs = model(token_ids, token_types, behavior_ids,
                        action_mask=action_mask)
-        # Sum all head outputs so every parameter gets gradients
         loss = sum(v.sum() for v in outputs.values())
+
+        # Teacher forward to exercise private_concept_tokens
+        priv_ids = torch.randint(1, 50, (B, 8))
+        priv_types = torch.randint(0, 6, (B, 8))
+        t_out = model(token_ids, token_types, behavior_ids,
+                      action_mask=action_mask,
+                      private_token_ids=priv_ids,
+                      private_token_types=priv_types,
+                      mode="teacher")
+        loss = loss + sum(v.sum() for v in t_out.values() if v is not None)
+
         loss.backward()
 
         # All parameters should have gradients
@@ -369,7 +380,7 @@ class TestGradientFlow:
             n_layers=1, n_heads=4, d_ff=256)
         loss = model.compute_diversity_loss()
         loss.backward()
-        # Concept tokens should have gradients
         assert model.concept_tokens.grad is not None
+        assert model.private_concept_tokens.grad is not None
 # 中文注释：验证 Transformer Backbone、多任务预测头和 TransformerPolicyValueNet 的前向传播与梯度流。
 

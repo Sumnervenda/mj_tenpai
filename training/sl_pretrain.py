@@ -29,12 +29,18 @@ from torch.amp import GradScaler, autocast
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from models import MahjongPolicyValueNet, save_checkpoint, load_checkpoint
+from models.model_io import save_resume_checkpoint, load_resume_checkpoint
+from models.transformer_policy_value import TransformerPolicyValueNet
 from data import (
     JSONLRecordParser,
     MJSONRecordParser,
     MahjongStateActionDataset,
     MJSONIterableDataset,
+    MJSONTokenIterableDataset,
+    MJSONPublicPrivateTokenIterableDataset,
     TensorShardBatchDataset,
+    TokenDataset,
+    collate_transformer_batch,
 )
 from training.mjson_cache import (
     build_mjson_cache,
@@ -80,6 +86,33 @@ LEGACY_METRIC_ALIASES = {
     'test/loss': ('test_loss',),
     'test/accuracy': ('test_acc', 'test_accuracy'),
 }
+
+
+def _make_checkpoint_metadata(args, best_val_acc: float) -> dict:
+    """Build checkpoint metadata including model architecture fields."""
+    meta = {
+        'model_arch': args.model_arch,
+        'training_stage': getattr(args, '_training_stage', 'public_sl'),
+        'val_acc': best_val_acc,
+    }
+    if args.model_arch == 'transformer':
+        meta.update({
+            'd_model': args.transformer_d_model,
+            'n_layers': args.transformer_n_layers,
+            'n_heads': args.transformer_n_heads,
+            'n_concept': args.transformer_n_concept,
+            'max_len': args.max_len,
+        })
+    if getattr(args, 'teacher_mode', False):
+        meta.update({
+            'teacher_mode': True,
+            'teacher_checkpoint': args.teacher_checkpoint,
+            'private_visibility': args.private_visibility,
+            'distill_temperature': args.distill_temperature,
+            'distill_alpha': args.distill_alpha,
+            'distill_value_alpha': args.distill_value_alpha,
+        })
+    return meta
 
 
 def configure_local_runtime_dirs(checkpoint_dir: str) -> None:
@@ -143,13 +176,14 @@ def multiprocessing_workers_available(num_workers: int) -> bool:
 def make_dataloader(dataset, batch_size: int, shuffle: bool, drop_last: bool,
                     use_cuda: bool, requested_workers: int,
                     prebatched: bool = False,
-                    prefetch_factor: int = 4) -> DataLoader:
+                    prefetch_factor: int = 4,
+                    collate_fn=None) -> DataLoader:
     """Create a DataLoader with safe worker fallback for Windows shells."""
     num_workers = requested_workers
     if not multiprocessing_workers_available(num_workers):
         num_workers = 0
 
-    kwargs = {
+    kwargs: Dict[str, Any] = {
         "pin_memory": use_cuda,
         "num_workers": num_workers,
     }
@@ -161,6 +195,8 @@ def make_dataloader(dataset, batch_size: int, shuffle: bool, drop_last: bool,
         kwargs["batch_size"] = batch_size
         kwargs["shuffle"] = shuffle
         kwargs["drop_last"] = drop_last
+    if collate_fn is not None:
+        kwargs["collate_fn"] = collate_fn
     if num_workers > 0:
         kwargs["persistent_workers"] = use_cuda
         kwargs["prefetch_factor"] = prefetch_factor
@@ -460,7 +496,9 @@ def parse_args():
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/')
     parser.add_argument('--resume', type=str, default=None,
-                        help='Resume from checkpoint')
+                        help='Resume from full checkpoint (model+optimizer+scheduler+scaler+RNG)')
+    parser.add_argument('--save_every', type=int, default=5,
+                        help='Save full resume checkpoint every N epochs (default: 5)')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device: cuda or cpu')
     parser.add_argument('--no_amp', action='store_true',
@@ -517,6 +555,47 @@ def parse_args():
                         help='W&B run id, name, or entity/project/run_id for --query_metrics')
     parser.add_argument('--describe_metrics', action='store_true',
                         help='Print metric meanings before query output')
+    parser.add_argument('--model_arch', type=str, default='resnet',
+                        choices=['resnet', 'transformer'],
+                        help='Model architecture (default: resnet)')
+    parser.add_argument('--mtl_alpha', type=float, default=0.3,
+                        help='Weight for shanten auxiliary loss (transformer only)')
+    parser.add_argument('--mtl_beta', type=float, default=0.2,
+                        help='Weight for ukeire auxiliary loss (transformer only)')
+    parser.add_argument('--transformer_d_model', type=int, default=256,
+                        help='Transformer hidden dimension')
+    parser.add_argument('--transformer_n_layers', type=int, default=6,
+                        help='Transformer encoder layers')
+    parser.add_argument('--transformer_n_heads', type=int, default=8,
+                        help='Transformer attention heads')
+    parser.add_argument('--transformer_n_concept', type=int, default=10,
+                        help='Transformer concept tokens (min 10)')
+    parser.add_argument('--max_len', type=int, default=256,
+                        help='Max token sequence length for Transformer')
+
+    # ── God's-eye Teacher-Student Training ────────────────────────────
+    parser.add_argument('--teacher_mode', action='store_true',
+                        help='Enable God\'s-eye teacher-student distillation')
+    parser.add_argument('--oracle_data', type=str, default=None,
+                        help='Path to oracle trajectory JSONL file or directory '
+                             '(from selfplay_recorder). For Transformer teacher/student training.')
+    parser.add_argument('--oracle_teacher_train', action='store_true',
+                        help='Train Oracle Teacher with teacher-mode forward '
+                             '(public+private) on oracle trajectory data. '
+                             'Requires --oracle_data and --model_arch transformer.')
+    parser.add_argument('--private_visibility', type=float, default=1.0,
+                        help='Fraction of private info teacher sees (0.0-1.0)')
+    parser.add_argument('--visibility_schedule', type=str, default=None,
+                        help='Comma-separated visibility values per epoch, '
+                             'e.g. "1.0,0.75,0.5,0.25,0.0"')
+    parser.add_argument('--distill_temperature', type=float, default=2.0,
+                        help='Temperature for KL distillation')
+    parser.add_argument('--distill_alpha', type=float, default=1.0,
+                        help='Weight for policy KL distillation loss')
+    parser.add_argument('--distill_value_alpha', type=float, default=0.5,
+                        help='Weight for value distillation loss')
+    parser.add_argument('--teacher_checkpoint', type=str, default=None,
+                        help='Path to frozen teacher checkpoint for distillation')
     return parser.parse_args()
 
 
@@ -584,6 +663,27 @@ def split_mjson_files(file_paths: List[str], train_ratio: float,
 def build_streaming_dataset(file_paths: List[str], shuffle_files: bool,
                             seed: int) -> MJSONIterableDataset:
     return MJSONIterableDataset(
+        file_paths=file_paths,
+        shuffle_files=shuffle_files,
+        seed=seed,
+        parser_verbose=False,
+    )
+
+
+def build_streaming_token_dataset(file_paths: List[str], shuffle_files: bool,
+                                   seed: int) -> MJSONTokenIterableDataset:
+    return MJSONTokenIterableDataset(
+        file_paths=file_paths,
+        shuffle_files=shuffle_files,
+        seed=seed,
+        parser_verbose=False,
+    )
+
+
+def build_streaming_public_private_token_dataset(
+        file_paths: List[str], shuffle_files: bool,
+        seed: int) -> MJSONPublicPrivateTokenIterableDataset:
+    return MJSONPublicPrivateTokenIterableDataset(
         file_paths=file_paths,
         shuffle_files=shuffle_files,
         seed=seed,
@@ -716,6 +816,562 @@ def validate(model: nn.Module, dataloader: DataLoader, device: str) -> dict:
     }
 
 
+def train_epoch_transformer(model: nn.Module, dataloader: DataLoader,
+                           optimizer: torch.optim.Optimizer, device: str,
+                           scaler: Optional[GradScaler] = None,
+                           alpha: float = 0.3, beta: float = 0.2) -> dict:
+    """训练一个 epoch（Transformer MTL），返回指标。"""
+    model.train()
+    total_loss = 0.0
+    total_policy_loss = 0.0
+    total_shanten_loss = 0.0
+    total_ukeire_loss = 0.0
+    correct = 0
+    total = 0
+    use_amp = scaler is not None
+    batch_count = 0
+    t_epoch_start = time.time()
+
+    for batch in dataloader:
+        token_ids = batch['token_ids'].to(device, dtype=torch.long)
+        token_types = batch['token_types'].to(device, dtype=torch.long)
+        behavior_ids = batch['behavior_ids'].to(device, dtype=torch.long)
+        attention_mask = batch['attention_mask'].to(device, dtype=torch.bool)
+        action_mask = batch['action_mask'].to(device, dtype=torch.float32)
+        labels = batch['labels'].to(device, dtype=torch.long)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with autocast('cuda', enabled=use_amp):
+            outputs = model(token_ids, token_types, behavior_ids,
+                           attention_mask, action_mask)
+            policy_logits = outputs['policy_logits']
+            policy_loss = nn.CrossEntropyLoss()(policy_logits, labels)
+
+            # Shanten head loss (CE over 7 classes)
+            shanten_loss = torch.tensor(0.0, device=device)
+            if 'oracle_shanten' in batch and alpha > 0:
+                shanten_targets = batch['oracle_shanten'].to(
+                    device, dtype=torch.long)
+                shanten_loss = nn.CrossEntropyLoss()(
+                    outputs['shanten'], shanten_targets)
+
+            # Ukeire head loss (BCE over 34 tiles)
+            ukeire_loss = torch.tensor(0.0, device=device)
+            if 'oracle_ukeire_mask' in batch and beta > 0:
+                ukeire_targets = batch['oracle_ukeire_mask'].to(
+                    device, dtype=torch.float32)
+                ukeire_logits = outputs.get('ukeire', None)
+                if ukeire_logits is not None and ukeire_logits.shape[-1] == 34:
+                    ukeire_loss = nn.BCEWithLogitsLoss()(
+                        ukeire_logits, ukeire_targets)
+
+            # Diversity regularization for concept tokens
+            div_loss = model.compute_diversity_loss() * 0.01
+
+            loss = policy_loss + alpha * shanten_loss + beta * ukeire_loss + div_loss
+
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+        B = token_ids.size(0)
+        total_loss += loss.item() * B
+        total_policy_loss += policy_loss.item() * B
+        total_shanten_loss += shanten_loss.item() * B
+        total_ukeire_loss += ukeire_loss.item() * B
+        preds = policy_logits.argmax(dim=-1)
+        correct += (preds == labels).sum().item()
+        total += B
+        batch_count += 1
+
+        if batch_count % 500 == 0:
+            elapsed = time.time() - t_epoch_start
+            avg_loss = total_loss / max(total, 1)
+            avg_acc = correct / max(total, 1)
+            print(f"    batch {batch_count}: loss={avg_loss:.4f} "
+                  f"acc={avg_acc:.4f} samples={total} "
+                  f"({elapsed:.0f}s elapsed)", flush=True)
+
+    return {
+        'loss': total_loss / max(total, 1),
+        'policy_loss': total_policy_loss / max(total, 1),
+        'shanten_loss': total_shanten_loss / max(total, 1),
+        'ukeire_loss': total_ukeire_loss / max(total, 1),
+        'accuracy': correct / max(total, 1),
+    }
+
+
+def train_epoch_transformer_distill(
+        model: nn.Module, dataloader: DataLoader,
+        optimizer: torch.optim.Optimizer, device: str,
+        scaler=None, alpha: float = 0.3, beta: float = 0.2,
+        distill_alpha: float = 1.0, distill_value_alpha: float = 0.5,
+        distill_temperature: float = 2.0,
+        private_visibility: float = 1.0,
+        teacher_model: Optional[nn.Module] = None) -> dict:
+    """训练一个 epoch（Teacher-Student 蒸馏模式）。
+
+    Student 只看 public tokens；Teacher 看 public + private tokens。
+    Loss = policy_ce + alpha * shanten_ce + beta * ukeire_bce
+           + distill_alpha * masked_kl(teacher, student)
+           + distill_value_alpha * value_mse
+
+    Args:
+        teacher_model: 独立的冻结 Teacher 模型。若为 None，使用 model 自身
+            做 teacher forward（teacher logits/value 会 detach 以阻断梯度）。
+        private_visibility: private tokens 可见比例（0.0~1.0），用于 curriculum。
+    """
+    from training.distillation import masked_kl_loss
+
+    model.train()
+    # 若有独立 teacher，设为 eval 模式并冻结
+    teacher = teacher_model if teacher_model is not None else model
+    if teacher_model is not None:
+        teacher_model.eval()
+
+    total_loss = 0.0
+    total_policy_loss = 0.0
+    total_distill_kl = 0.0
+    total_value_mse = 0.0
+    correct = 0
+    total = 0
+    use_amp = scaler is not None
+
+    has_private = True  # set to False when private fields are not in batch
+
+    for batch in dataloader:
+        if not isinstance(batch, dict):
+            continue  # skip non-dict batches (misconfigured dataloader)
+
+        token_ids = batch['token_ids'].to(device, dtype=torch.long)
+        token_types = batch['token_types'].to(device, dtype=torch.long)
+        behavior_ids = batch['behavior_ids'].to(device, dtype=torch.long)
+        attention_mask = batch['attention_mask'].to(device, dtype=torch.bool)
+        action_mask = batch['action_mask'].to(device, dtype=torch.float32)
+        labels = batch['labels'].to(device, dtype=torch.long)
+
+        # Private tokens (optional, skip if not present)
+        priv_ids = batch.get('private_token_ids')
+        if priv_ids is not None and priv_ids.shape[1] > 0:
+            priv_ids = priv_ids.to(device, dtype=torch.long)
+            priv_types = batch['private_token_types'].to(device, dtype=torch.long)
+            priv_behavior = batch.get('private_behavior_ids')
+            if priv_behavior is not None:
+                priv_behavior = priv_behavior.to(device, dtype=torch.long)
+            priv_attn = batch.get('private_attention_mask')
+            if priv_attn is not None:
+                priv_attn = priv_attn.to(device, dtype=torch.bool)
+            has_private = True
+        else:
+            has_private = False
+
+        # ── visibility curriculum：Bernoulli dropout on private tokens ──
+        if has_private and private_visibility < 1.0:
+            B_priv = priv_ids.size(0)
+            n_priv = priv_ids.size(1)
+            if n_priv > 0:
+                keep_mask = (torch.rand(B_priv, n_priv, device=device)
+                             < private_visibility)
+                # visibility=0 → 零化所有 private token，但仍走 Teacher forward
+                # （Teacher cross-attention 在全 PAD private 下等价于 public-only）
+                if not keep_mask.any():
+                    priv_ids = priv_ids.clone()
+                    priv_ids[:] = 0
+                    priv_types = priv_types.clone()
+                    priv_types[:] = 0
+                    if priv_attn is not None:
+                        priv_attn = priv_attn.clone()
+                        priv_attn[:] = True
+                    if priv_behavior is not None:
+                        priv_behavior = priv_behavior.clone()
+                        priv_behavior[:] = 0
+                else:
+                    # 每个样本至少保留 1 个 token（visibility > 0 时）
+                    any_kept = keep_mask.any(dim=1)
+                    if not any_kept.all():
+                        fix = (~any_kept).nonzero(as_tuple=True)[0]
+                        keep_mask[fix, 0] = True
+                    # PAD 掉未保留的 private token
+                    priv_ids = priv_ids.clone()
+                    priv_ids[~keep_mask] = 0
+                    priv_types = priv_types.clone()
+                    priv_types[~keep_mask] = 0
+                    if priv_attn is not None:
+                        priv_attn = priv_attn.clone()
+                        priv_attn = priv_attn | ~keep_mask
+                    if priv_behavior is not None:
+                        priv_behavior = priv_behavior.clone()
+                        priv_behavior[~keep_mask] = 0
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with autocast('cuda', enabled=use_amp):
+            # Student: public-only forward
+            outputs_s = model(token_ids, token_types, behavior_ids,
+                            attention_mask, action_mask, mode='student')
+            policy_loss = nn.CrossEntropyLoss()(
+                outputs_s['policy_logits'], labels)
+
+            # MTL auxiliary losses
+            shanten_loss = torch.tensor(0.0, device=device)
+            if 'oracle_shanten' in batch and alpha > 0:
+                shanten_loss = nn.CrossEntropyLoss()(
+                    outputs_s['shanten'],
+                    batch['oracle_shanten'].to(device, dtype=torch.long))
+
+            ukeire_loss = torch.tensor(0.0, device=device)
+            if 'oracle_ukeire_mask' in batch and beta > 0:
+                ukeire_targets = batch['oracle_ukeire_mask'].to(
+                    device, dtype=torch.float32)
+                ukeire_logits = outputs_s.get('ukeire', None)
+                if ukeire_logits is not None and ukeire_logits.shape[-1] == 34:
+                    ukeire_loss = nn.BCEWithLogitsLoss()(
+                        ukeire_logits, ukeire_targets)
+
+            distill_kl = torch.tensor(0.0, device=device)
+            value_mse = torch.tensor(0.0, device=device)
+
+            if has_private and (distill_alpha > 0 or distill_value_alpha > 0):
+                # Teacher: public + private forward（不回传梯度到 teacher）
+                with torch.no_grad():
+                    outputs_t = teacher(
+                        token_ids, token_types, behavior_ids,
+                        attention_mask, action_mask,
+                        private_token_ids=priv_ids,
+                        private_token_types=priv_types,
+                        private_behavior_ids=priv_behavior,
+                        private_attention_mask=priv_attn,
+                        mode='teacher')
+
+                # Detach teacher logits/value 以阻断梯度回传
+                if distill_alpha > 0:
+                    teacher_logits = outputs_t['policy_logits'].detach()
+                    distill_kl = masked_kl_loss(
+                        teacher_logits,
+                        outputs_s['policy_logits'],
+                        action_mask,
+                        temperature=distill_temperature,
+                    )
+
+                if distill_value_alpha > 0:
+                    oracle_v = outputs_t.get('oracle_value', outputs_t['value'])
+                    oracle_v = oracle_v.detach()
+                    value_mse = nn.MSELoss()(outputs_s['value'], oracle_v)
+
+            div_loss = model.compute_diversity_loss() * 0.01
+
+            loss = (policy_loss + alpha * shanten_loss + beta * ukeire_loss
+                    + distill_alpha * distill_kl
+                    + distill_value_alpha * value_mse
+                    + div_loss)
+
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+        B = token_ids.size(0)
+        total_loss += loss.item() * B
+        total_policy_loss += policy_loss.item() * B
+        total_distill_kl += distill_kl.item() * B
+        total_value_mse += value_mse.item() * B
+        preds = outputs_s['policy_logits'].argmax(dim=-1)
+        correct += (preds == labels).sum().item()
+        total += B
+
+    result = {
+        'loss': total_loss / max(total, 1),
+        'policy_loss': total_policy_loss / max(total, 1),
+        'accuracy': correct / max(total, 1),
+    }
+    if has_private:
+        result['distill/kl'] = total_distill_kl / max(total, 1)
+        result['distill/value_mse'] = total_value_mse / max(total, 1)
+    if total == 0:
+        raise RuntimeError(
+            'train_epoch_transformer_distill processed 0 valid samples. '
+            'Check that --oracle_data or MJSON data contains enough samples '
+            'for the given --batch_size. If using small data, use --batch_size 1 '
+            'or record more games.')
+    return result
+
+
+def train_epoch_teacher(
+        model: nn.Module, dataloader: DataLoader,
+        optimizer: torch.optim.Optimizer, device: str,
+        scaler=None, alpha: float = 0.3, beta: float = 0.2,
+        value_loss_coef: float = 0.5,
+        require_private: bool = False) -> dict:
+    """训练一个 epoch（Oracle Teacher，mode='teacher'）。
+
+    Teacher 看 public + private tokens，直接从 oracle 轨迹学习。
+    Loss = policy_ce + value_mse + alpha * shanten_ce + beta * ukeire_bce + diversity
+
+    Args:
+        value_loss_coef: oracle_value 与 reward 的 MSE 权重
+        require_private: 若为 True，遇到无 private tokens 的 batch 时 raise 而非 skip
+    """
+    model.train()
+    total_loss = 0.0
+    total_policy_loss = 0.0
+    total_value_loss = 0.0
+    correct = 0
+    total = 0
+    use_amp = scaler is not None
+
+    for batch in dataloader:
+        if not isinstance(batch, dict):
+            continue
+
+        token_ids = batch['token_ids'].to(device, dtype=torch.long)
+        token_types = batch['token_types'].to(device, dtype=torch.long)
+        behavior_ids = batch['behavior_ids'].to(device, dtype=torch.long)
+        attention_mask = batch['attention_mask'].to(device, dtype=torch.bool)
+        action_mask = batch['action_mask'].to(device, dtype=torch.float32)
+        labels = batch['labels'].to(device, dtype=torch.long)
+
+        # Private tokens (required for teacher training)
+        priv_ids = batch.get('private_token_ids')
+        if priv_ids is None or priv_ids.shape[1] == 0:
+            if require_private:
+                raise RuntimeError(
+                    'train_epoch_teacher: batch has no private tokens. '
+                    'Oracle training requires non-empty private_token_ids in every batch. '
+                    'Check that oracle_data contains valid samples.')
+            continue  # skip batches without private tokens
+        priv_ids = priv_ids.to(device, dtype=torch.long)
+        priv_types = batch['private_token_types'].to(device, dtype=torch.long)
+        priv_behavior = batch.get('private_behavior_ids')
+        if priv_behavior is not None:
+            priv_behavior = priv_behavior.to(device, dtype=torch.long)
+        priv_attn = batch.get('private_attention_mask')
+        if priv_attn is not None:
+            priv_attn = priv_attn.to(device, dtype=torch.bool)
+
+        # Reward / outcome targets (optional)
+        rewards = batch.get('rewards')
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with autocast('cuda', enabled=use_amp):
+            outputs = model(
+                token_ids, token_types, behavior_ids,
+                attention_mask, action_mask,
+                private_token_ids=priv_ids,
+                private_token_types=priv_types,
+                private_behavior_ids=priv_behavior,
+                private_attention_mask=priv_attn,
+                mode='teacher')
+
+            policy_logits = outputs['policy_logits']
+            policy_loss = nn.CrossEntropyLoss()(policy_logits, labels)
+
+            # Value loss: oracle_value vs actual reward
+            value_loss = torch.tensor(0.0, device=device)
+            oracle_v = outputs.get('oracle_value', outputs.get('value'))
+            if oracle_v is not None and rewards is not None:
+                rewards_t = rewards.to(device, dtype=torch.float32)
+                value_loss = nn.MSELoss()(oracle_v.squeeze(-1), rewards_t)
+
+            # MTL auxiliary losses
+            shanten_loss = torch.tensor(0.0, device=device)
+            if 'oracle_shanten' in batch and alpha > 0:
+                shanten_loss = nn.CrossEntropyLoss()(
+                    outputs['shanten'],
+                    batch['oracle_shanten'].to(device, dtype=torch.long))
+
+            ukeire_loss = torch.tensor(0.0, device=device)
+            if 'oracle_ukeire_mask' in batch and beta > 0:
+                ukeire_logits = outputs.get('ukeire', None)
+                if ukeire_logits is not None and ukeire_logits.shape[-1] == 34:
+                    ukeire_loss = nn.BCEWithLogitsLoss()(
+                        ukeire_logits,
+                        batch['oracle_ukeire_mask'].to(device, dtype=torch.float32))
+
+            div_loss = model.compute_diversity_loss() * 0.01
+
+            loss = (policy_loss + value_loss_coef * value_loss
+                    + alpha * shanten_loss + beta * ukeire_loss + div_loss)
+
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+        B = token_ids.size(0)
+        total_loss += loss.item() * B
+        total_policy_loss += policy_loss.item() * B
+        total_value_loss += value_loss.item() * B
+        preds = policy_logits.argmax(dim=-1)
+        correct += (preds == labels).sum().item()
+        total += B
+
+    if total == 0:
+        raise RuntimeError(
+            'train_epoch_teacher processed 0 valid samples. '
+            'Check that --oracle_data contains non-empty token samples '
+            '(ResNet/heuristic recorder with --model_arch heuristic now '
+            'creates tokens automatically). If using small data, ensure '
+            'batch_size <= sample count or use --oracle_data with enough games.')
+
+    return {
+        'loss': total_loss / total,
+        'policy_loss': total_policy_loss / total,
+        'value_loss': total_value_loss / total,
+        'accuracy': correct / total,
+    }
+
+
+def validate_transformer(model: nn.Module, dataloader: DataLoader,
+                         device: str, alpha: float = 0.3,
+                         beta: float = 0.2) -> dict:
+    """验证 Transformer 模型，返回指标。"""
+    model.eval()
+    total_loss = 0.0
+    total_policy_loss = 0.0
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for batch in dataloader:
+            token_ids = batch['token_ids'].to(device, dtype=torch.long)
+            token_types = batch['token_types'].to(device, dtype=torch.long)
+            behavior_ids = batch['behavior_ids'].to(device, dtype=torch.long)
+            attention_mask = batch['attention_mask'].to(device, dtype=torch.bool)
+            action_mask = batch['action_mask'].to(device, dtype=torch.float32)
+            labels = batch['labels'].to(device, dtype=torch.long)
+
+            outputs = model(token_ids, token_types, behavior_ids,
+                           attention_mask, action_mask)
+            policy_logits = outputs['policy_logits']
+            policy_loss = nn.CrossEntropyLoss()(policy_logits, labels)
+
+            B = token_ids.size(0)
+            total_loss += policy_loss.item() * B
+            total_policy_loss += policy_loss.item() * B
+            preds = policy_logits.argmax(dim=-1)
+            correct += (preds == labels).sum().item()
+            total += B
+
+    if total == 0:
+        raise RuntimeError(
+            'validate_transformer processed 0 valid samples. '
+            'Check that validation data is non-empty and batch_size is '
+            'smaller than sample count.')
+
+    return {
+        'loss': total_loss / total,
+        'policy_loss': total_policy_loss / total,
+        'accuracy': correct / total,
+    }
+
+
+def validate_teacher(model: nn.Module, dataloader: DataLoader,
+                     device: str, alpha: float = 0.3,
+                     beta: float = 0.2,
+                     value_loss_coef: float = 0.5,
+                     require_private: bool = False) -> dict:
+    """验证 Oracle Teacher 模型（mode='teacher' + private tokens）。
+
+    Args:
+        require_private: 若为 True，遇到无 private tokens 的 batch 时 raise 而非 skip
+    """
+    model.eval()
+    total_loss = 0.0
+    total_policy_loss = 0.0
+    total_value_loss = 0.0
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for batch in dataloader:
+            if not isinstance(batch, dict):
+                continue
+            token_ids = batch['token_ids'].to(device, dtype=torch.long)
+            token_types = batch['token_types'].to(device, dtype=torch.long)
+            behavior_ids = batch['behavior_ids'].to(device, dtype=torch.long)
+            attention_mask = batch['attention_mask'].to(device, dtype=torch.bool)
+            action_mask = batch['action_mask'].to(device, dtype=torch.float32)
+            labels = batch['labels'].to(device, dtype=torch.long)
+
+            priv_ids = batch.get('private_token_ids')
+            if priv_ids is None or priv_ids.shape[1] == 0:
+                if require_private:
+                    raise RuntimeError(
+                        'validate_teacher: batch has no private tokens. '
+                        'Oracle training requires non-empty private_token_ids '
+                        'in every batch.')
+                continue
+            priv_ids = priv_ids.to(device, dtype=torch.long)
+            priv_types = batch['private_token_types'].to(device, dtype=torch.long)
+            priv_behavior = batch.get('private_behavior_ids')
+            if priv_behavior is not None:
+                priv_behavior = priv_behavior.to(device, dtype=torch.long)
+            priv_attn = batch.get('private_attention_mask')
+            if priv_attn is not None:
+                priv_attn = priv_attn.to(device, dtype=torch.bool)
+            rewards = batch.get('rewards')
+
+            outputs = model(
+                token_ids, token_types, behavior_ids,
+                attention_mask, action_mask,
+                private_token_ids=priv_ids,
+                private_token_types=priv_types,
+                private_behavior_ids=priv_behavior,
+                private_attention_mask=priv_attn,
+                mode='teacher')
+
+            policy_logits = outputs['policy_logits']
+            policy_loss = nn.CrossEntropyLoss()(policy_logits, labels)
+
+            value_loss = torch.tensor(0.0, device=device)
+            oracle_v = outputs.get('oracle_value', outputs.get('value'))
+            if oracle_v is not None and rewards is not None:
+                rewards_t = rewards.to(device, dtype=torch.float32)
+                value_loss = nn.MSELoss()(oracle_v.squeeze(-1), rewards_t)
+
+            B = token_ids.size(0)
+            total_loss += (policy_loss.item() + value_loss_coef * value_loss.item()) * B
+            total_policy_loss += policy_loss.item() * B
+            total_value_loss += value_loss.item() * B
+            preds = policy_logits.argmax(dim=-1)
+            correct += (preds == labels).sum().item()
+            total += B
+
+    if total == 0:
+        raise RuntimeError(
+            'validate_teacher processed 0 valid samples. '
+            'Check that oracle data contains non-empty private tokens '
+            'and valid action_mask / chosen_action fields.')
+
+    return {
+        'loss': total_loss / total,
+        'policy_loss': total_policy_loss / total,
+        'value_loss': total_value_loss / total,
+        'accuracy': correct / total,
+    }
+
+
 def main():
     args = parse_args()
 
@@ -741,6 +1397,28 @@ def main():
         print(f"GPU: {torch.cuda.get_device_name(0)} "
               f"({torch.cuda.get_device_properties(0).total_memory // 1024**2:,} MB VRAM)")
 
+    # 模型架构标记（需在数据加载前确定，用于选择 dataset 类型）
+    is_transformer = args.model_arch == 'transformer'
+
+    # ── 从 checkpoint 提前读取架构元数据（必须在数据加载前） ──
+    resume_meta: Dict[str, Any] = {}
+    if args.resume:
+        _ckpt = torch.load(args.resume, map_location='cpu', weights_only=False)
+        resume_meta = _ckpt.get('metadata', {})
+        ckpt_arch = resume_meta.get('model_arch', args.model_arch)
+        if ckpt_arch != args.model_arch:
+            print(f"Auto-detected model_arch={ckpt_arch} from checkpoint "
+                  f"(overriding --model_arch={args.model_arch})")
+            args.model_arch = ckpt_arch
+        # 恢复 Transformer 超参数
+        for key in ('d_model', 'n_layers', 'n_heads', 'n_concept', 'max_len'):
+            ckpt_val = resume_meta.get(key)
+            arg_key = f'transformer_{key}' if key != 'max_len' else 'max_len'
+            if ckpt_val is not None and hasattr(args, arg_key):
+                setattr(args, arg_key, ckpt_val)
+        # 更新架构标记（checkpoint 可能覆盖了 args.model_arch）
+        is_transformer = (args.model_arch == 'transformer')
+
     # 数据加载 or 生成
     if args.generate > 0:
         from .heuristic_agent import generate_training_data
@@ -752,7 +1430,101 @@ def main():
     prebatched_mode = False
     cache_manifest = build_cache_if_requested(args, mjson_years)
 
-    if args.data_format == 'mjson_cache':
+    if args.teacher_mode and is_transformer and args.data_format != 'mjson' and not args.oracle_data:
+        raise ValueError(
+            '--teacher_mode requires --data_format mjson with '
+            '--random_split_all_mjson and --stream_mjson, '
+            'or --oracle_data (recorder JSONL with public+private tokens).')
+
+    if args.teacher_mode and is_transformer and not args.teacher_checkpoint:
+        raise ValueError(
+            '--teacher_mode requires --teacher_checkpoint. '
+            'Student distillation must load a pre-trained frozen Teacher; '
+            'self-distillation (same model as Teacher) is not supported. '
+            'Train a Teacher first with standard SL, then pass its checkpoint.')
+
+    # Oracle teacher training validation
+    if args.oracle_teacher_train:
+        if not is_transformer:
+            raise ValueError(
+                '--oracle_teacher_train requires --model_arch transformer.')
+        if not args.oracle_data:
+            raise ValueError(
+                '--oracle_teacher_train requires --oracle_data '
+                '(path to recorder JSONL from selfplay_recorder).')
+        if args.teacher_mode:
+            raise ValueError(
+                '--oracle_teacher_train and --teacher_mode are mutually exclusive. '
+                '--oracle_teacher_train trains the Teacher itself; '
+                '--teacher_mode trains a Student via distillation from a frozen Teacher.')
+
+    # 确定训练阶段：teacher_train / student_distill / public_sl
+    if is_transformer:
+        if args.oracle_teacher_train:
+            args._training_stage = 'teacher_train'
+        elif args.teacher_mode:
+            args._training_stage = 'student_distill'
+        else:
+            args._training_stage = 'public_sl'
+
+        # Teacher 模式下 public+private 拼接后序列可能远超 public-only 长度，
+        # 自动提升 max_len 以避免位置编码溢出
+        _needs_teacher_len = (args._training_stage in ('teacher_train', 'student_distill')
+                              and args.oracle_data)
+        if _needs_teacher_len and args.max_len < 512:
+            print(f"Auto-bumping --max_len from {args.max_len} to 512 "
+                  f"for teacher/student training with oracle data "
+                  f"(public+private padded length can exceed 256).")
+            args.max_len = 512
+
+    # Oracle trajectory data loading (from selfplay_recorder JSONL)
+    if args.oracle_data and is_transformer:
+        from data.dataset import OracleTrajectoryIterableDataset
+        oracle_path = Path(args.oracle_data)
+        if oracle_path.is_file():
+            oracle_files = [str(oracle_path)]
+        elif oracle_path.is_dir():
+            oracle_files = sorted(str(p) for p in oracle_path.glob('*.jsonl'))
+        else:
+            raise ValueError(f'--oracle_data path not found: {args.oracle_data}')
+        if not oracle_files:
+            raise ValueError(f'No .jsonl files found in {args.oracle_data}')
+
+        # 文件级 split：小样本时复用文件保证 val/test 非空
+        rng = np.random.default_rng(args.split_seed)
+        n_files = len(oracle_files)
+        if n_files >= 3:
+            indices = rng.permutation(n_files)
+            n_train = max(1, int(n_files * 0.8))
+            n_val = max(1, int(n_files * 0.1))
+            train_files = [oracle_files[i] for i in indices[:n_train]]
+            val_files = [oracle_files[i] for i in indices[n_train:n_train + n_val]]
+            test_files = [oracle_files[i] for i in indices[n_train + n_val:]]
+            # 保证 test 非空
+            if not test_files:
+                test_files = val_files
+        else:
+            # 1-2 个文件：全部复用，避免空 val/test 导致除零
+            train_files = oracle_files
+            val_files = oracle_files
+            test_files = oracle_files
+        print(f"Oracle trajectory file split: train={len(train_files)}, "
+              f"val={len(val_files)}, test={len(test_files)}")
+
+        streaming_mode = True
+        train_set = OracleTrajectoryIterableDataset(
+            train_files, shuffle_files=True, seed=args.split_seed)
+        val_set = OracleTrajectoryIterableDataset(
+            val_files, shuffle_files=False, seed=args.split_seed)
+        test_set = OracleTrajectoryIterableDataset(
+            test_files, shuffle_files=False, seed=args.split_seed)
+
+    elif args.data_format == 'mjson_cache':
+        if is_transformer:
+            raise ValueError(
+                'mjson_cache does not support Transformer yet. '
+                'Use --data_format mjson with --random_split_all_mjson and '
+                '--stream_mjson instead.')
         cache_dir = resolve_mjson_cache_dir(args)
         if cache_manifest is None:
             cache_manifest = load_mjson_cache_manifest(cache_dir)
@@ -807,13 +1579,34 @@ def main():
         print(f"Random file split: train={len(train_files)}, val={len(val_files)}, test={len(test_files)}")
 
         streaming_mode = True
-        train_set = build_streaming_dataset(train_files, shuffle_files=True,
-                                            seed=args.split_seed)
-        val_set = build_streaming_dataset(val_files, shuffle_files=False,
-                                          seed=args.split_seed)
-        test_set = build_streaming_dataset(test_files, shuffle_files=False,
-                                           seed=args.split_seed)
+        if is_transformer:
+            if args.teacher_mode:
+                train_set = build_streaming_public_private_token_dataset(
+                    train_files, shuffle_files=True, seed=args.split_seed)
+                val_set = build_streaming_public_private_token_dataset(
+                    val_files, shuffle_files=False, seed=args.split_seed)
+                test_set = build_streaming_public_private_token_dataset(
+                    test_files, shuffle_files=False, seed=args.split_seed)
+            else:
+                train_set = build_streaming_token_dataset(
+                    train_files, shuffle_files=True, seed=args.split_seed)
+                val_set = build_streaming_token_dataset(
+                    val_files, shuffle_files=False, seed=args.split_seed)
+                test_set = build_streaming_token_dataset(
+                    test_files, shuffle_files=False, seed=args.split_seed)
+        else:
+            train_set = build_streaming_dataset(
+                train_files, shuffle_files=True, seed=args.split_seed)
+            val_set = build_streaming_dataset(
+                val_files, shuffle_files=False, seed=args.split_seed)
+            test_set = build_streaming_dataset(
+                test_files, shuffle_files=False, seed=args.split_seed)
     elif args.train_data or args.val_data or args.test_data:
+        if is_transformer:
+            raise ValueError(
+                'Explicit data paths with --model_arch transformer require '
+                '--random_split_all_mjson and --stream_mjson. '
+                'Direct state-tensor datasets are not compatible with Transformer.')
         if not (args.train_data and args.test_data):
             raise ValueError('train_data and test_data must be provided together when using explicit dataset paths')
 
@@ -836,6 +1629,11 @@ def main():
                                  max_mjson_files=args.max_test_mjson_files)
             print(f"Cross-year split: train={len(train_set)}, val={len(val_set)} (from train_data), test={len(test_set)}")
     else:
+        if is_transformer:
+            raise ValueError(
+                'Direct data loading with --model_arch transformer requires '
+                '--random_split_all_mjson and --stream_mjson. '
+                'Direct state-tensor datasets are not compatible with Transformer.')
         dataset = load_data(args.data, data_format=args.data_format,
                             max_mjson_files=args.max_mjson_files)
 
@@ -846,15 +1644,19 @@ def main():
     if not streaming_mode and (len(train_set) == 0 or len(val_set) == 0 or len(test_set) == 0):
         raise ValueError('Train/val/test datasets must all be non-empty')
 
+    train_collate = collate_transformer_batch if is_transformer else None
+    # Oracle/teacher 数据默认 drop_last=False，避免小样本被整批丢弃
+    train_drop_last = not args.oracle_data
     train_loader = make_dataloader(
         train_set,
         batch_size=args.batch_size,
         shuffle=not streaming_mode,
-        drop_last=True,
+        drop_last=train_drop_last,
         use_cuda=use_cuda,
         requested_workers=args.num_workers,
         prebatched=prebatched_mode,
         prefetch_factor=args.prefetch_factor,
+        collate_fn=train_collate,
     )
     val_loader = make_dataloader(
         val_set,
@@ -865,17 +1667,29 @@ def main():
         requested_workers=args.num_workers,
         prebatched=prebatched_mode,
         prefetch_factor=args.prefetch_factor,
+        collate_fn=train_collate,
     )
 
+    # resume_meta 已在数据加载前读取（见上方 checkpoint 元数据提取）
+
     # 模型
-    model = MahjongPolicyValueNet()
+    if is_transformer:
+        model = TransformerPolicyValueNet(
+            d_model=args.transformer_d_model,
+            n_layers=args.transformer_n_layers,
+            n_heads=args.transformer_n_heads,
+            n_concept=args.transformer_n_concept,
+            max_len=args.max_len,
+        )
+    else:
+        model = MahjongPolicyValueNet()
     model = model.to(device)
 
     if args.compile and hasattr(torch, 'compile'):
         model = torch.compile(model, mode='reduce-overhead')
         print("Model compiled with torch.compile")
 
-    print(f"Model: {model.count_parameters():,} parameters")
+    print(f"Model ({args.model_arch}): {model.count_parameters():,} parameters")
 
     optimizer = AdamW(model.parameters(), lr=args.lr,
                       weight_decay=args.weight_decay)
@@ -885,11 +1699,12 @@ def main():
     scaler = GradScaler('cuda', enabled=use_cuda and not args.no_amp)
 
     start_epoch = 0
-    resume_meta: Dict[str, Any] = {}
     if args.resume:
-        start_epoch, resume_meta = load_checkpoint(
-            model, args.resume, optimizer=optimizer, device=device)
-        print(f"Resumed from epoch {start_epoch}")
+        start_epoch, resume_meta = load_resume_checkpoint(
+            model, args.resume, optimizer=optimizer,
+            scheduler=scheduler, scaler=scaler, device=device)
+        print(f"Resumed from epoch {start_epoch} "
+              f"(scheduler/scaler/RNG restored)")
 
     # 训练循环
     Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
@@ -897,8 +1712,86 @@ def main():
         resume_meta.get('best_val_acc', resume_meta.get('val_acc', 0.0)) or 0.0
     )
     history = list(resume_meta.get('history', []))
+
+    # 加载独立 Teacher checkpoint（teacher_mode 下必须提供）
+    teacher_model = None
+    if args.teacher_checkpoint and is_transformer and args.teacher_mode:
+        from models.model_io import infer_transformer_config_from_state_dict
+        _teacher_ckpt = torch.load(args.teacher_checkpoint, map_location=device,
+                                   weights_only=False)
+        _teacher_meta = _teacher_ckpt.get('metadata', {})
+        _teacher_arch = _teacher_meta.get('model_arch', 'transformer')
+        if _teacher_arch != 'transformer':
+            raise ValueError(
+                f'--teacher_checkpoint must be a Transformer model, '
+                f'but got model_arch={_teacher_arch!r}. '
+                f'ResNet teacher is not supported for Transformer student distillation '
+                f'(ResNet.forward() does not accept token inputs or mode="teacher").')
+        _sd = _teacher_ckpt['model_state_dict']
+        # 从 metadata + state_dict 推断完整配置（metadata 缺失时从权重形状补充）
+        _teacher_cfg = infer_transformer_config_from_state_dict(_sd, _teacher_meta)
+        _teacher_d_model = _teacher_cfg.get('d_model', args.transformer_d_model)
+        _teacher_n_layers = _teacher_cfg.get('n_layers', args.transformer_n_layers)
+        _teacher_n_concept = _teacher_cfg.get('n_concept', args.transformer_n_concept)
+        _teacher_max_len = _teacher_cfg.get('max_len', args.max_len)
+        # n_heads 无法从权重可靠推断，必须在 metadata 中明确指定
+        _teacher_n_heads = _teacher_meta.get('n_heads')
+        if _teacher_n_heads is None:
+            raise ValueError(
+                'Teacher checkpoint metadata is missing n_heads. '
+                'n_heads cannot be reliably inferred from state_dict. '
+                'Please re-save the teacher checkpoint with n_heads in metadata, '
+                'or pass --transformer_n_heads explicitly when training the teacher.')
+
+        teacher_model = TransformerPolicyValueNet(
+            d_model=_teacher_d_model,
+            n_layers=_teacher_n_layers,
+            n_heads=_teacher_n_heads,
+            n_concept=_teacher_n_concept,
+            max_len=_teacher_max_len,
+        )
+        teacher_model.load_state_dict(_sd)
+        teacher_model = teacher_model.to(device)
+        teacher_model.eval()
+        for p in teacher_model.parameters():
+            p.requires_grad_(False)
+        print(f"Loaded frozen Transformer teacher from {args.teacher_checkpoint} "
+              f"(d_model={_teacher_d_model}, n_layers={_teacher_n_layers}, "
+              f"n_concept={_teacher_n_concept}, max_len={_teacher_max_len})")
+        # 校验 Teacher checkpoint 的 max_len 是否足够
+        if args.oracle_data and _teacher_max_len < args.max_len:
+            raise ValueError(
+                f"Frozen Teacher checkpoint max_len={_teacher_max_len} is smaller "
+                f"than student max_len={args.max_len}. "
+                f"Oracle data with public+private tokens may produce sequences "
+                f"longer than {_teacher_max_len} in teacher forward. "
+                f"Please re-train the Teacher with --max_len {args.max_len} "
+                f"or higher before distilling the Student.")
     if start_epoch == 0:
         metrics_history_path(args.checkpoint_dir).write_text('', encoding='utf-8')
+
+    # ── MTL 标签可用性状态报告 ──
+    if is_transformer:
+        print("\n[MTL Head Status]")
+        print(f"  policy:     always trained (human action labels)")
+        print(f"  shanten:    {'weight={:.2f}, expects oracle_shanten labels'.format(args.mtl_alpha) if args.mtl_alpha > 0 else 'weight=0.0, skipped'}")
+        print(f"  ukeire:     {'weight={:.2f}, expects oracle_ukeire_mask labels'.format(args.mtl_beta) if args.mtl_beta > 0 else 'weight=0.0, skipped'}")
+        print("  danger:     PLACEHOLDER (label always 0.0 — no training signal)")
+        print("  score:      PLACEHOLDER (label always 0.0 — no training signal)")
+        print("  efficiency: PLACEHOLDER (label always 0.0 — no training signal)")
+        if args.teacher_mode:
+            print(f"  distill KL: weight={args.distill_alpha}, "
+                  f"temperature={args.distill_temperature}")
+            print(f"  value MSE:  weight={args.distill_value_alpha}")
+            print(f"  visibility: {args.private_visibility} "
+                  f"(schedule={args.visibility_schedule or 'N/A'})")
+        if streaming_mode:
+            print("  [Note] Streaming MJSON pipeline provides public/private tokens")
+            print("         but NOT oracle_shanten/ukeire labels (collate has no")
+            print("         'oracle_shanten' or 'oracle_ukeire_mask' keys).")
+            print("         MTL auxiliary heads receive no training signal in streaming mode.")
+            print("         Use mjson_cache (TensorShardBatchDataset) to train MTL heads.")
+        print()
 
     amp_status = "AMP" if (use_cuda and not args.no_amp) else "FP32"
     print(f"\nTraining on {device} ({amp_status}) for {args.epochs} epochs...")
@@ -917,8 +1810,10 @@ def main():
                 name=run_name,
                 entity=args.wandb_entity,
                 config={
+                    'model_arch': args.model_arch,
                     'model': model.count_parameters(),
-                    'dataset': args.data or args.random_split_all_mjson or args.train_data,
+                    'dataset': args.oracle_data or args.data or args.random_split_all_mjson or args.train_data,
+                    'oracle_data': args.oracle_data,
                     'data_format': args.data_format,
                     'mjson_years': args.mjson_years,
                     'mjson_cache_dir': args.mjson_cache_dir,
@@ -933,6 +1828,20 @@ def main():
                     'device': device,
                     'amp': use_cuda and not args.no_amp,
                     'compile': args.compile,
+                    'training_stage': getattr(args, '_training_stage', 'public_sl'),
+                    'mtl_alpha': args.mtl_alpha if is_transformer else None,
+                    'mtl_beta': args.mtl_beta if is_transformer else None,
+                    'teacher_mode': args.teacher_mode,
+                    'private_visibility': args.private_visibility if args.teacher_mode else None,
+                    'distill_temperature': args.distill_temperature if args.teacher_mode else None,
+                    'distill_alpha': args.distill_alpha if args.teacher_mode else None,
+                    'distill_value_alpha': args.distill_value_alpha if args.teacher_mode else None,
+                    'mtl_policy': 'always_trained',
+                    'mtl_shanten': 'active' if (is_transformer and args.mtl_alpha > 0) else 'off',
+                    'mtl_ukeire': 'active' if (is_transformer and args.mtl_beta > 0) else 'off',
+                    'mtl_danger': 'PLACEHOLDER_no_label',
+                    'mtl_score': 'PLACEHOLDER_no_label',
+                    'mtl_efficiency': 'PLACEHOLDER_no_label',
                 },
                 reinit="finish_previous",
                 settings=wandb.Settings(
@@ -942,7 +1851,8 @@ def main():
             )
             wandb.define_metric('epoch')
             for metric_pattern in ('train/*', 'val/*', 'test/*',
-                                   'time/*', 'best_val_accuracy', 'lr'):
+                                   'time/*', 'best_val_accuracy', 'lr',
+                                   'distill/*', 'teacher/*', 'student/*'):
                 wandb.define_metric(metric_pattern, step_metric='epoch')
             wandb.watch(model, log='gradients', log_freq=100)
         except Exception as exc:
@@ -958,9 +1868,48 @@ def main():
             train_set.set_epoch(epoch)
 
         print(f'  Starting epoch {epoch+1} training...', flush=True)
-        train_metrics = train_epoch(
-            model, train_loader, optimizer, device, scaler)
-        val_metrics = validate(model, val_loader, device)
+
+        # 解析 visibility_schedule（每个 epoch 使用不同的 private_visibility）
+        if is_transformer and args.teacher_mode and args.visibility_schedule:
+            _vis_list = [float(v) for v in args.visibility_schedule.split(',')]
+            _vis_idx = min(epoch - start_epoch, len(_vis_list) - 1)
+            current_visibility = _vis_list[_vis_idx]
+        else:
+            current_visibility = args.private_visibility
+
+        if is_transformer:
+            if args.oracle_teacher_train:
+                train_metrics = train_epoch_teacher(
+                    model, train_loader, optimizer, device, scaler,
+                    alpha=args.mtl_alpha, beta=args.mtl_beta,
+                    require_private=True)
+            elif args.teacher_mode:
+                train_metrics = train_epoch_transformer_distill(
+                    model, train_loader, optimizer, device, scaler,
+                    alpha=args.mtl_alpha, beta=args.mtl_beta,
+                    distill_alpha=args.distill_alpha,
+                    distill_value_alpha=args.distill_value_alpha,
+                    distill_temperature=args.distill_temperature,
+                    private_visibility=current_visibility,
+                    teacher_model=teacher_model)
+            else:
+                train_metrics = train_epoch_transformer(
+                    model, train_loader, optimizer, device, scaler,
+                    alpha=args.mtl_alpha, beta=args.mtl_beta)
+            if args.oracle_teacher_train:
+                val_metrics = validate_teacher(
+                    model, val_loader, device,
+                    alpha=args.mtl_alpha, beta=args.mtl_beta,
+                    value_loss_coef=0.5,
+                    require_private=True)
+            else:
+                val_metrics = validate_transformer(
+                    model, val_loader, device,
+                    alpha=args.mtl_alpha, beta=args.mtl_beta)
+        else:
+            train_metrics = train_epoch(
+                model, train_loader, optimizer, device, scaler)
+            val_metrics = validate(model, val_loader, device)
 
         scheduler.step()
         elapsed = time.time() - t0
@@ -970,13 +1919,20 @@ def main():
         if is_best:
             best_val_acc = val_metrics['accuracy']
 
-        history.append({
+        history_record = {
             'epoch': epoch + 1,
             'train_loss': train_metrics['loss'],
             'train_acc': train_metrics['accuracy'],
             'val_loss': val_metrics['loss'],
             'val_acc': val_metrics['accuracy'],
-        })
+        }
+        if is_transformer and 'policy_loss' in train_metrics:
+            history_record['train_policy_loss'] = train_metrics['policy_loss']
+            history_record['train_shanten_loss'] = train_metrics.get(
+                'shanten_loss', 0.0)
+            history_record['train_ukeire_loss'] = train_metrics.get(
+                'ukeire_loss', 0.0)
+        history.append(history_record)
         epoch_metrics = {
             'phase': 'train_val',
             '_step': epoch + 1,
@@ -990,37 +1946,76 @@ def main():
             'time/epoch_sec': elapsed,
             'train/num_workers': train_loader.num_workers,
             'train/batch_size': args.batch_size,
+            'model_arch': args.model_arch,
         }
+        if is_transformer:
+            epoch_metrics['train/policy_loss'] = train_metrics.get(
+                'policy_loss', 0.0)
+            epoch_metrics['train/shanten_loss'] = train_metrics.get(
+                'shanten_loss', 0.0)
+            epoch_metrics['train/ukeire_loss'] = train_metrics.get(
+                'ukeire_loss', 0.0)
+        if is_transformer and args.teacher_mode:
+            epoch_metrics['train/private_visibility'] = current_visibility
+            epoch_metrics['distill/kl'] = train_metrics.get(
+                'distill/kl', 0.0)
+            epoch_metrics['distill/value_mse'] = train_metrics.get(
+                'distill/value_mse', 0.0)
+        if is_transformer and args.oracle_teacher_train:
+            epoch_metrics['teacher/train_value_loss'] = train_metrics.get(
+                'value_loss', 0.0)
+            epoch_metrics['teacher/val_value_loss'] = val_metrics.get(
+                'value_loss', 0.0)
         append_metric_history(args.checkpoint_dir, epoch_metrics)
 
-        print(f"{epoch + 1:>6} {train_metrics['loss']:>12.4f} "
-              f"{train_metrics['accuracy']:>10.4f} "
-              f"{val_metrics['loss']:>10.4f} {val_metrics['accuracy']:>8.4f} "
-              f"{elapsed:>7.1f}s {current_lr:>10.2e}")
+        if is_transformer:
+            print(f"{epoch + 1:>6} loss={train_metrics['loss']:.4f} "
+                  f"policy={train_metrics.get('policy_loss', 0):.4f} "
+                  f"acc={train_metrics['accuracy']:.4f} "
+                  f"val_loss={val_metrics['loss']:.4f} "
+                  f"val_acc={val_metrics['accuracy']:.4f} "
+                  f"{elapsed:.1f}s lr={current_lr:.2e}")
+        else:
+            print(f"{epoch + 1:>6} {train_metrics['loss']:>12.4f} "
+                  f"{train_metrics['accuracy']:>10.4f} "
+                  f"{val_metrics['loss']:>10.4f} {val_metrics['accuracy']:>8.4f} "
+                  f"{elapsed:>7.1f}s {current_lr:>10.2e}")
 
         if wandb_run is not None:
             wandb_run.log(epoch_metrics, step=epoch + 1)
 
-        # 保存最佳模型
+        # 保存最佳模型（带完整续训状态）
         if is_best:
-            save_checkpoint(
-                model, optimizer, epoch + 1,
+            save_resume_checkpoint(
+                model, optimizer, scheduler, scaler, epoch + 1,
                 os.path.join(args.checkpoint_dir, 'sl_best.pt'),
-                metadata={'val_acc': best_val_acc, 'config': vars(args)},
+                metadata={**_make_checkpoint_metadata(args, best_val_acc),
+                           'best_val_acc': best_val_acc, 'history': history},
             )
 
-        # 定期保存
-        if (epoch + 1) % 5 == 0:
-            save_checkpoint(
-                model, optimizer, epoch + 1,
+        # 每个 epoch 结束都保存 sl_resume.pt（完整续训状态）
+        save_resume_checkpoint(
+            model, optimizer, scheduler, scaler, epoch + 1,
+            os.path.join(args.checkpoint_dir, 'sl_resume.pt'),
+            metadata={**_make_checkpoint_metadata(args, best_val_acc),
+                       'best_val_acc': best_val_acc, 'history': history},
+        )
+
+        # 定期保存带编号的 checkpoint（完整续训状态）
+        if (epoch + 1) % args.save_every == 0:
+            save_resume_checkpoint(
+                model, optimizer, scheduler, scaler, epoch + 1,
                 os.path.join(args.checkpoint_dir, f'sl_epoch_{epoch + 1:03d}.pt'),
+                metadata={**_make_checkpoint_metadata(args, best_val_acc),
+                           'best_val_acc': best_val_acc, 'history': history},
             )
 
-    # 最终保存
-    save_checkpoint(
-        model, optimizer, start_epoch + args.epochs,
+    # 最终保存（完整续训状态）
+    save_resume_checkpoint(
+        model, optimizer, scheduler, scaler, start_epoch + args.epochs,
         os.path.join(args.checkpoint_dir, 'sl_final.pt'),
-        metadata={'history': history, 'best_val_acc': best_val_acc},
+        metadata={'history': history, 'best_val_acc': best_val_acc,
+                  **_make_checkpoint_metadata(args, best_val_acc)},
     )
 
     # 测试集评估
@@ -1033,10 +2028,22 @@ def main():
         requested_workers=args.num_workers,
         prebatched=prebatched_mode,
         prefetch_factor=args.prefetch_factor,
+        collate_fn=train_collate,
     )
-    test_metrics = validate(model, test_loader, device)
+    if is_transformer:
+        if args.oracle_teacher_train:
+            test_metrics = validate_teacher(model, test_loader, device,
+                                            alpha=args.mtl_alpha, beta=args.mtl_beta,
+                                            value_loss_coef=0.5,
+                                            require_private=True)
+        else:
+            test_metrics = validate_transformer(model, test_loader, device)
+    else:
+        test_metrics = validate(model, test_loader, device)
+    test_value_loss = test_metrics.get('value_loss')
     print(f"\nTest: loss={test_metrics['loss']:.4f}, "
-          f"accuracy={test_metrics['accuracy']:.4f}")
+          f"accuracy={test_metrics['accuracy']:.4f}"
+          + (f", value_loss={test_value_loss:.4f}" if test_value_loss is not None else ""))
     print(f"Best val accuracy: {best_val_acc:.4f}")
     print(f"Model saved to {args.checkpoint_dir}")
 
@@ -1048,7 +2055,10 @@ def main():
         'test/loss': test_metrics['loss'],
         'test/accuracy': test_metrics['accuracy'],
         'best_val_accuracy': best_val_acc,
+        'model_arch': args.model_arch,
     }
+    if test_value_loss is not None:
+        final_metrics['test/value_loss'] = test_value_loss
     append_metric_history(args.checkpoint_dir, final_metrics)
     write_metrics_summary(args.checkpoint_dir, {
         **final_metrics,
