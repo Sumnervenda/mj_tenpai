@@ -202,12 +202,17 @@ def main():
                     print(f"  +compile: {r2['batch_s']:.1f} batch/s | "
                           f"{r2['samples_s']:.0f} samples/s | "
                           f"VRAM {r2['max_vram_gb']:.1f} GB")
-                except RuntimeError as e:
-                    if 'out of memory' in str(e).lower():
+                except (RuntimeError, Exception) as e:
+                    _msg = str(e).lower()
+                    if 'out of memory' in _msg:
                         print(f"  +compile: OOM at batch_size={bs}")
                         torch.cuda.empty_cache()
+                    elif 'python.h' in _msg or 'calledprocesserror' in _msg:
+                        print(f"  +compile: skipped (missing dev headers, "
+                              f"run: sudo apt install python3-dev)")
                     else:
-                        raise
+                        print(f"  +compile: skipped ({type(e).__name__}: "
+                              f"{str(e)[:80]})")
         print()
 
     # 汇总
