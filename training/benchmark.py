@@ -217,7 +217,8 @@ def main():
     print(f"      Estimated samples_per_epoch = 420M (900K files x 670 samples)")
 
     # 保存结果
-    out_path = os.path.join(os.path.dirname(args.checkpoint), 'benchmark_results.json')
+    _base_dir = os.path.dirname(args.checkpoint) if args.checkpoint else '.'
+    out_path = os.path.join(_base_dir, 'benchmark_results.json')
     with open(out_path, 'w') as f:
         json.dump(results, f, indent=2)
     print(f"\nResults saved to {out_path}")
