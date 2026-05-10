@@ -11,25 +11,29 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-CKPT="${1:-checkpoints/transformer_server/sl_best.pt}"
+CKPT="${1:-}"
 BATCHES="${BENCHMARK_BATCHES:-1000}"
 
 echo "=========================================="
 echo "  GPU Benchmark"
 echo "=========================================="
-echo "Checkpoint: $CKPT"
-echo "Batches:    $BATCHES"
-echo ""
 
 # GPU 信息
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>/dev/null || echo "No GPU detected"
 echo ""
 
+# 构建参数
+BENCH_ARGS="--batches $BATCHES --sizes 128,256,512"
+if [ -n "$CKPT" ] && [ -f "$CKPT" ]; then
+    echo "Checkpoint: $CKPT"
+    BENCH_ARGS="$BENCH_ARGS --checkpoint $CKPT"
+else
+    echo "No checkpoint found, using randomly initialized model"
+fi
+echo ""
+
 # 运行基准测试
-python -m training.benchmark \
-    --checkpoint "$CKPT" \
-    --batches "$BATCHES" \
-    --sizes 128,256,512
+python -m training.benchmark $BENCH_ARGS
 
 echo ""
 echo "=========================================="

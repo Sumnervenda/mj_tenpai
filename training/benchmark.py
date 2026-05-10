@@ -92,8 +92,9 @@ def run_benchmark(model, device, batch_size, num_batches, use_amp=True,
 
 def main():
     parser = argparse.ArgumentParser(description='GPU benchmark for Transformer training')
-    parser.add_argument('--checkpoint', type=str, required=True,
-                        help='Path to model checkpoint (.pt)')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Path to model checkpoint (.pt). '
+                             'If omitted, uses randomly initialized model.')
     parser.add_argument('--batches', type=int, default=1000,
                         help='Number of batches per config (default: 1000)')
     parser.add_argument('--sizes', type=str, default='128,256,512',
@@ -102,16 +103,33 @@ def main():
                         help='Device (default: cuda)')
     parser.add_argument('--no_compile', action='store_true',
                         help='Skip torch.compile test')
+    parser.add_argument('--d_model', type=int, default=256)
+    parser.add_argument('--n_layers', type=int, default=6)
+    parser.add_argument('--n_heads', type=int, default=8)
+    parser.add_argument('--n_concept', type=int, default=10)
+    parser.add_argument('--max_len', type=int, default=256)
     args = parser.parse_args()
 
-    # 加载模型配置
-    meta = load_checkpoint_metadata(args.checkpoint)
-    ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-    sd = ckpt['model_state_dict']
-    cfg = infer_transformer_config_from_state_dict(sd, meta)
-
-    d_model = cfg.get('d_model', 256)
-    n_layers = cfg.get('n_layers', 6)
+    # 加载或使用默认模型配置
+    if args.checkpoint:
+        meta = load_checkpoint_metadata(args.checkpoint)
+        ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+        sd = ckpt['model_state_dict']
+        cfg = infer_transformer_config_from_state_dict(sd, meta)
+        d_model = cfg.get('d_model', 256)
+        n_layers = cfg.get('n_layers', 6)
+        n_heads = cfg.get('n_heads', 8)
+        n_concept = cfg.get('n_concept', 10)
+        max_len = cfg.get('max_len', 256)
+        print(f"Loaded checkpoint: {args.checkpoint}")
+    else:
+        sd = None
+        d_model = args.d_model
+        n_layers = args.n_layers
+        n_heads = args.n_heads
+        n_concept = args.n_concept
+        max_len = args.max_len
+        print("No checkpoint provided, using randomly initialized model")
     n_heads = cfg.get('n_heads', 8)
     n_concept = cfg.get('n_concept', 10)
     max_len = cfg.get('max_len', 256)
@@ -139,7 +157,8 @@ def main():
         model = TransformerPolicyValueNet(
             d_model=d_model, n_layers=n_layers, n_heads=n_heads,
             n_concept=n_concept, max_len=max_len)
-        model.load_state_dict(sd)
+        if sd is not None:
+            model.load_state_dict(sd)
         model = model.to(args.device)
 
         try:
@@ -161,7 +180,8 @@ def main():
             model2 = TransformerPolicyValueNet(
                 d_model=d_model, n_layers=n_layers, n_heads=n_heads,
                 n_concept=n_concept, max_len=max_len)
-            model2.load_state_dict(sd)
+            if sd is not None:
+                model2.load_state_dict(sd)
             model2 = model2.to(args.device)
             try:
                 r2 = run_benchmark(model2, args.device, bs, min(args.batches, 200),
