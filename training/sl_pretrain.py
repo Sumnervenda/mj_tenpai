@@ -596,6 +596,21 @@ def parse_args():
                         help='Weight for value distillation loss')
     parser.add_argument('--teacher_checkpoint', type=str, default=None,
                         help='Path to frozen teacher checkpoint for distillation')
+
+    # ── Step-level checkpoint / profiling / benchmark ──────────────────
+    parser.add_argument('--save_interval_min', type=float, default=0,
+                        help='Save resume checkpoint every N minutes (0=disabled, '
+                             'recommended: 30 for spot instances)')
+    parser.add_argument('--max_batches', type=int, default=0,
+                        help='Stop after N total batches across all epochs (0=no limit)')
+    parser.add_argument('--resume_batch', type=int, default=0,
+                        help='Number of batches to fast-forward on resume (saved in checkpoint metadata)')
+    parser.add_argument('--manifest', type=str, default=None,
+                        help='Path to data split manifest JSON (replaces random split)')
+    parser.add_argument('--benchmark', action='store_true',
+                        help='Run benchmark mode: measure throughput for --benchmark_batches then exit')
+    parser.add_argument('--benchmark_batches', type=int, default=1000,
+                        help='Number of batches per benchmark run (default: 1000)')
     return parser.parse_args()
 
 
@@ -819,8 +834,25 @@ def validate(model: nn.Module, dataloader: DataLoader, device: str) -> dict:
 def train_epoch_transformer(model: nn.Module, dataloader: DataLoader,
                            optimizer: torch.optim.Optimizer, device: str,
                            scaler: Optional[GradScaler] = None,
-                           alpha: float = 0.3, beta: float = 0.2) -> dict:
-    """训练一个 epoch（Transformer MTL），返回指标。"""
+                           alpha: float = 0.3, beta: float = 0.2,
+                           save_callback=None,
+                           skip_batches: int = 0,
+                           max_batches: int = 0,
+                           global_batch_offset: int = 0,
+                           save_interval_batches: int = 0) -> dict:
+    """训练一个 epoch（Transformer MTL），返回指标。
+
+    Args:
+        save_callback: 可选的回调函数 save_callback(total_batches_processed)
+                       在 save_interval_batches 到达时调用
+        skip_batches: 快速前进跳过的 batch 数（断点续训用）
+        max_batches: 本 epoch 最多训练的 batch 数（0=不限制）
+        global_batch_offset: 全局 batch 计数偏移（用于日志显示）
+        save_interval_batches: 每隔多少 batch 调用 save_callback（0=禁用）
+
+    Returns:
+        dict: 包含 loss, accuracy 等指标，以及 '_batches_trained' 和 '_stopped_early'
+    """
     model.train()
     total_loss = 0.0
     total_policy_loss = 0.0
@@ -830,9 +862,28 @@ def train_epoch_transformer(model: nn.Module, dataloader: DataLoader,
     total = 0
     use_amp = scaler is not None
     batch_count = 0
+    skipped = 0
     t_epoch_start = time.time()
+    t_last_log = t_epoch_start
+    stopped_early = False
+
+    # 计算 profiling 用的 data_wait 累计
+    t_data_wait_total = 0.0
+    t_gpu_step_total = 0.0
 
     for batch in dataloader:
+        batch_count += 1
+
+        # ── Fast-forward: 跳过已训练的 batches ──
+        if skipped < skip_batches:
+            skipped += 1
+            if skipped % 5000 == 0:
+                print(f"    [fast-forward] skipped {skipped}/{skip_batches} batches",
+                      flush=True)
+            continue
+
+        t_data_end = time.time()
+
         token_ids = batch['token_ids'].to(device, dtype=torch.long)
         token_types = batch['token_types'].to(device, dtype=torch.long)
         behavior_ids = batch['behavior_ids'].to(device, dtype=torch.long)
@@ -842,13 +893,13 @@ def train_epoch_transformer(model: nn.Module, dataloader: DataLoader,
 
         optimizer.zero_grad(set_to_none=True)
 
+        t_gpu_start = time.time()
         with autocast('cuda', enabled=use_amp):
             outputs = model(token_ids, token_types, behavior_ids,
                            attention_mask, action_mask)
             policy_logits = outputs['policy_logits']
             policy_loss = nn.CrossEntropyLoss()(policy_logits, labels)
 
-            # Shanten head loss (CE over 7 classes)
             shanten_loss = torch.tensor(0.0, device=device)
             if 'oracle_shanten' in batch and alpha > 0:
                 shanten_targets = batch['oracle_shanten'].to(
@@ -856,7 +907,6 @@ def train_epoch_transformer(model: nn.Module, dataloader: DataLoader,
                 shanten_loss = nn.CrossEntropyLoss()(
                     outputs['shanten'], shanten_targets)
 
-            # Ukeire head loss (BCE over 34 tiles)
             ukeire_loss = torch.tensor(0.0, device=device)
             if 'oracle_ukeire_mask' in batch and beta > 0:
                 ukeire_targets = batch['oracle_ukeire_mask'].to(
@@ -866,9 +916,7 @@ def train_epoch_transformer(model: nn.Module, dataloader: DataLoader,
                     ukeire_loss = nn.BCEWithLogitsLoss()(
                         ukeire_logits, ukeire_targets)
 
-            # Diversity regularization for concept tokens
             div_loss = model.compute_diversity_loss() * 0.01
-
             loss = policy_loss + alpha * shanten_loss + beta * ukeire_loss + div_loss
 
         if use_amp:
@@ -882,6 +930,8 @@ def train_epoch_transformer(model: nn.Module, dataloader: DataLoader,
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
+        t_gpu_end = time.time()
+
         B = token_ids.size(0)
         total_loss += loss.item() * B
         total_policy_loss += policy_loss.item() * B
@@ -890,15 +940,43 @@ def train_epoch_transformer(model: nn.Module, dataloader: DataLoader,
         preds = policy_logits.argmax(dim=-1)
         correct += (preds == labels).sum().item()
         total += B
-        batch_count += 1
 
-        if batch_count % 500 == 0:
+        # 训练的 batch 数（不含 fast-forward）
+        trained = batch_count - skipped
+        effective_global = global_batch_offset + trained
+
+        # profiling 累计
+        t_data_wait_total += (t_data_end - t_last_log if trained > 1 else 0)
+        t_gpu_step_total += (t_gpu_end - t_gpu_start)
+        t_last_log = t_gpu_end
+
+        # ── Profiling 日志 ──
+        if trained % 500 == 0:
             elapsed = time.time() - t_epoch_start
             avg_loss = total_loss / max(total, 1)
             avg_acc = correct / max(total, 1)
-            print(f"    batch {batch_count}: loss={avg_loss:.4f} "
-                  f"acc={avg_acc:.4f} samples={total} "
-                  f"({elapsed:.0f}s elapsed)", flush=True)
+            batch_s = trained / max(elapsed, 1e-6)
+            samples_s = total / max(elapsed, 1e-6)
+            max_mem = (torch.cuda.max_memory_allocated() / 1024**3
+                       if torch.cuda.is_available() else 0)
+            seq_len = token_ids.size(1)
+            print(f"    batch {effective_global}: loss={avg_loss:.4f} "
+                  f"acc={avg_acc:.4f} | "
+                  f"{batch_s:.1f} batch/s {samples_s:.0f} samples/s | "
+                  f"seq_len={seq_len} GPU_mem={max_mem:.1f}GB | "
+                  f"{elapsed:.0f}s", flush=True)
+
+        # ── Step-level checkpoint 保存 ──
+        if save_interval_batches > 0 and save_callback is not None:
+            if trained % save_interval_batches == 0 and trained > 0:
+                save_callback(effective_global)
+
+        # ── max_batches 限制 ──
+        if max_batches > 0 and trained >= max_batches:
+            print(f"    [max_batches] reached {max_batches}, stopping epoch early",
+                  flush=True)
+            stopped_early = True
+            break
 
     return {
         'loss': total_loss / max(total, 1),
@@ -906,6 +984,8 @@ def train_epoch_transformer(model: nn.Module, dataloader: DataLoader,
         'shanten_loss': total_shanten_loss / max(total, 1),
         'ukeire_loss': total_ukeire_loss / max(total, 1),
         'accuracy': correct / max(total, 1),
+        '_batches_trained': batch_count - skipped,
+        '_stopped_early': stopped_early,
     }
 
 
@@ -1566,17 +1646,45 @@ def main():
         if not args.stream_mjson:
             raise ValueError('random_split_all_mjson requires --stream_mjson to avoid exhausting memory')
 
-        all_files = collect_mjson_files(args.random_split_all_mjson,
-                                        max_files=args.max_mjson_files,
-                                        years=mjson_years)
-        train_files, val_files, test_files = split_mjson_files(
-            all_files,
-            train_ratio=args.train_ratio,
-            val_ratio=args.val_ratio,
-            test_ratio=args.test_ratio,
-            seed=args.split_seed,
-        )
-        print(f"Random file split: train={len(train_files)}, val={len(val_files)}, test={len(test_files)}")
+        # ── 数据划分：manifest 或随机 split ──
+        if args.manifest:
+            import json as _json
+            with open(args.manifest, 'r', encoding='utf-8') as _mf:
+                _manifest = _json.load(_mf)
+            train_files = _manifest['train_files']
+            val_files = _manifest['val_files']
+            test_files = _manifest['test_files']
+            print(f"Loaded manifest: train={len(train_files)}, "
+                  f"val={len(val_files)}, test={len(test_files)}")
+        else:
+            all_files = collect_mjson_files(args.random_split_all_mjson,
+                                            max_files=args.max_mjson_files,
+                                            years=mjson_years)
+            train_files, val_files, test_files = split_mjson_files(
+                all_files,
+                train_ratio=args.train_ratio,
+                val_ratio=args.val_ratio,
+                test_ratio=args.test_ratio,
+                seed=args.split_seed,
+            )
+            # 自动保存 manifest 以便复现
+            _manifest_path = os.path.join(args.checkpoint_dir, 'data_manifest.json')
+            Path(_manifest_path).parent.mkdir(parents=True, exist_ok=True)
+            import json as _json
+            with open(_manifest_path, 'w', encoding='utf-8') as _mf:
+                _json.dump({
+                    'train_files': train_files,
+                    'val_files': val_files,
+                    'test_files': test_files,
+                    'seed': args.split_seed,
+                    'train_ratio': args.train_ratio,
+                    'val_ratio': args.val_ratio,
+                    'test_ratio': args.test_ratio,
+                    'years': mjson_years,
+                }, _mf, ensure_ascii=False, indent=2)
+            print(f"Random file split: train={len(train_files)}, "
+                  f"val={len(val_files)}, test={len(test_files)}")
+            print(f"Manifest saved to {_manifest_path}")
 
         streaming_mode = True
         if is_transformer:
@@ -1699,12 +1807,19 @@ def main():
     scaler = GradScaler('cuda', enabled=use_cuda and not args.no_amp)
 
     start_epoch = 0
+    skip_batches = 0
+    total_batches_trained = 0
     if args.resume:
         start_epoch, resume_meta = load_resume_checkpoint(
             model, args.resume, optimizer=optimizer,
             scheduler=scheduler, scaler=scaler, device=device)
+        # 恢复 skip_batches：优先用 checkpoint 中的值，其次用命令行参数
+        skip_batches = resume_meta.get('resume_batch', args.resume_batch)
+        total_batches_trained = resume_meta.get('total_batches', 0)
         print(f"Resumed from epoch {start_epoch} "
-              f"(scheduler/scaler/RNG restored)")
+              f"(scheduler/scaler/RNG restored, "
+              f"skip_batches={skip_batches}, "
+              f"total_batches={total_batches_trained})")
 
     # 训练循环
     Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
@@ -1861,13 +1976,45 @@ def main():
                 "Run `wandb login` or check the local runtime directory permissions."
             ) from exc
 
+    # ── Step-level checkpoint 配置 ──
+    # 将 save_interval_min 转换为 batch 数（估算：~3150 samples/sec, batch_size=256 → ~12.3 batch/s）
+    save_interval_batches = 0
+    if args.save_interval_min > 0:
+        # 每秒约 12 batch（保守估计），转换为 batch 数
+        est_batches_per_sec = 12.0
+        save_interval_batches = max(100, int(args.save_interval_min * 60 * est_batches_per_sec))
+        print(f"Step-level checkpoint: every {save_interval_batches} batches "
+              f"(~{args.save_interval_min} min)")
+
+    def _make_step_checkpoint(global_batches):
+        """保存 step-level resume checkpoint"""
+        _ckpt_path = os.path.join(args.checkpoint_dir, 'sl_resume.pt')
+        _meta = {
+            **_make_checkpoint_metadata(args, best_val_acc),
+            'best_val_acc': best_val_acc,
+            'history': history,
+            'total_batches': global_batches,
+            'resume_batch': 0,  # 续训时从 epoch 开头 fast-forward
+        }
+        save_resume_checkpoint(model, optimizer, scheduler, scaler, epoch,
+                               _ckpt_path, metadata=_meta)
+        print(f"    [checkpoint] saved at global_batch={global_batches} "
+              f"-> {_ckpt_path}", flush=True)
+
     for epoch in range(start_epoch, start_epoch + args.epochs):
         t0 = time.time()
 
         if streaming_mode and hasattr(train_set, 'set_epoch'):
             train_set.set_epoch(epoch)
 
-        print(f'  Starting epoch {epoch+1} training...', flush=True)
+        # 只在 resume 后的第一个 epoch fast-forward
+        epoch_skip = skip_batches if epoch == start_epoch else 0
+        if epoch_skip > 0:
+            print(f"  Fast-forwarding {epoch_skip} batches in epoch {epoch+1}...",
+                  flush=True)
+
+        print(f'  Starting epoch {epoch+1} training '
+              f'(global_batches={total_batches_trained})...', flush=True)
 
         # 解析 visibility_schedule（每个 epoch 使用不同的 private_visibility）
         if is_transformer and args.teacher_mode and args.visibility_schedule:
@@ -1895,7 +2042,12 @@ def main():
             else:
                 train_metrics = train_epoch_transformer(
                     model, train_loader, optimizer, device, scaler,
-                    alpha=args.mtl_alpha, beta=args.mtl_beta)
+                    alpha=args.mtl_alpha, beta=args.mtl_beta,
+                    save_callback=_make_step_checkpoint,
+                    skip_batches=epoch_skip,
+                    max_batches=args.max_batches,
+                    global_batch_offset=total_batches_trained,
+                    save_interval_batches=save_interval_batches)
             if args.oracle_teacher_train:
                 val_metrics = validate_teacher(
                     model, val_loader, device,
@@ -1914,6 +2066,11 @@ def main():
         scheduler.step()
         elapsed = time.time() - t0
         current_lr = scheduler.get_last_lr()[0]
+
+        # 更新全局 batch 计数
+        epoch_batches = train_metrics.get('_batches_trained', 0)
+        total_batches_trained += epoch_batches
+        stopped_early = train_metrics.get('_stopped_early', False)
 
         is_best = val_metrics['accuracy'] > best_val_acc
         if is_best:
@@ -1984,21 +2141,28 @@ def main():
         if wandb_run is not None:
             wandb_run.log(epoch_metrics, step=epoch + 1)
 
+        # 元数据：包含 total_batches 以便 step-level 续训
+        _ckpt_meta = {
+            **_make_checkpoint_metadata(args, best_val_acc),
+            'best_val_acc': best_val_acc,
+            'history': history,
+            'total_batches': total_batches_trained,
+            'resume_batch': 0,
+        }
+
         # 保存最佳模型（带完整续训状态）
         if is_best:
             save_resume_checkpoint(
                 model, optimizer, scheduler, scaler, epoch + 1,
                 os.path.join(args.checkpoint_dir, 'sl_best.pt'),
-                metadata={**_make_checkpoint_metadata(args, best_val_acc),
-                           'best_val_acc': best_val_acc, 'history': history},
+                metadata=_ckpt_meta,
             )
 
         # 每个 epoch 结束都保存 sl_resume.pt（完整续训状态）
         save_resume_checkpoint(
             model, optimizer, scheduler, scaler, epoch + 1,
             os.path.join(args.checkpoint_dir, 'sl_resume.pt'),
-            metadata={**_make_checkpoint_metadata(args, best_val_acc),
-                       'best_val_acc': best_val_acc, 'history': history},
+            metadata=_ckpt_meta,
         )
 
         # 定期保存带编号的 checkpoint（完整续训状态）
@@ -2006,9 +2170,14 @@ def main():
             save_resume_checkpoint(
                 model, optimizer, scheduler, scaler, epoch + 1,
                 os.path.join(args.checkpoint_dir, f'sl_epoch_{epoch + 1:03d}.pt'),
-                metadata={**_make_checkpoint_metadata(args, best_val_acc),
-                           'best_val_acc': best_val_acc, 'history': history},
+                metadata=_ckpt_meta,
             )
+
+        # max_batches 到达后提前结束
+        if stopped_early:
+            print(f"  Training stopped early after {total_batches_trained} total batches",
+                  flush=True)
+            break
 
     # 最终保存（完整续训状态）
     save_resume_checkpoint(

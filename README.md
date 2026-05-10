@@ -211,32 +211,51 @@ python -m training.iterative_rl \
 
 ## 云服务器训练
 
-### 一键配置
+### 快速上手（推荐流程）
 
 ```bash
-# 克隆仓库
-git clone git@github.com:Sumnervenda/mj_tenpai.git
-cd mj_tenpai
-
-# 一键配置（自动检测 GPU、安装 PyTorch + CUDA、验证环境）
+# 1. 克隆 + 一键配置
+git clone git@github.com:Sumnervenda/mj_tenpai.git && cd mj_tenpai
 chmod +x setup_server.sh && ./setup_server.sh
+
+# 2. 上传数据集（推荐打包后上传，避免几十万小文件）
+# 本地打包: tar -cf dataset_2021_2026.tar dataset/datasets_years/202[1-6]*
+scp dataset_2021_2026.tar user@server:~/mj_tenpai/
+# 服务器解压: tar -xf dataset_2021_2026.tar
+
+# 3. 先跑短基准（确认 GPU 性能）
+chmod +x run_benchmark.sh && ./run_benchmark.sh
+
+# 4. 启动训练（step-level checkpoint 每 30 分钟自动保存）
+chmod +x run_train.sh && ./run_train.sh
 ```
 
-### 手动配置
+### 短基准脚本（租卡后第一步）
 
 ```bash
-# 1. 创建虚拟环境
-python3 -m venv .venv && source .venv/bin/activate
+# 跑 1000 batches，输出 batch/s、samples/s、VRAM、预计 epoch 时长
+python -m training.benchmark --checkpoint checkpoints/transformer_server/sl_best.pt
 
-# 2. 安装 PyTorch（根据 CUDA 版本选择）
-pip install torch --index-url https://download.pytorch.org/whl/cu124  # CUDA 12.4
-# pip install torch --index-url https://download.pytorch.org/whl/cu118  # CUDA 11.8
+# 自定义 batch sizes
+python -m training.benchmark --checkpoint sl_best.pt --sizes 128,256,512 --batches 500
+```
 
-# 3. 安装依赖
-pip install -r requirements.txt
+**决策阈值**（推理速度，训练约为推理的 40%）：
 
-# 4. 验证
-python -c "import torch; print(torch.cuda.is_available())"
+| 推理 batch/s | 评价 | 预计训练耗时/epoch |
+|---|---|---|
+| >= 30 | Excellent | ~10h |
+| 20-30 | Good | ~15h |
+| < 20 | 检查配置 | >20h |
+
+### 数据 Split Manifest（确保可复现）
+
+```bash
+# 生成 manifest（train/val/test 文件列表）
+python scripts/save_manifest.py --root dataset/datasets_years --years 2021-2026
+
+# 使用 manifest 训练（跨机器保证相同 split）
+python -m training.sl_pretrain --manifest dataset/datasets_years/manifest_2021-2026_seed42.json ...
 ```
 
 ### 上传数据集
@@ -244,17 +263,21 @@ python -c "import torch; print(torch.cuda.is_available())"
 数据集 (`dataset/datasets_years/`) 未包含在 git 中，需单独上传：
 
 ```bash
-# 从本地上传到服务器
-scp -r dataset/datasets_years/ user@server:~/mj_tenpai/dataset/
+# 推荐：打包后上传（一个大文件比 90 万小文件快得多）
+tar -cf dataset_2021_2026.tar dataset/datasets_years/202[1-6]*
+scp dataset_2021_2026.tar user@server:~/mj_tenpai/
 
-# 或使用 rsync（支持断点续传）
+# 替代方案：rsync（支持断点续传）
 rsync -avz --progress dataset/datasets_years/ user@server:~/mj_tenpai/dataset/datasets_years/
 ```
 
 ### 训练命令
 
 ```bash
-# Transformer SL 预训练（2021-2026 数据，batch_size=256 适配 16GB 显存）
+# 一键启动训练（脚本内已配置所有参数）
+./run_train.sh
+
+# 手动启动（完整参数）
 python -m training.sl_pretrain \
     --data_format mjson \
     --random_split_all_mjson dataset/datasets_years \
@@ -262,43 +285,63 @@ python -m training.sl_pretrain \
     --stream_mjson \
     --model_arch transformer \
     --epochs 10 --batch_size 256 --lr 3e-4 \
-    --save_every 2 --wandb \
-    --wandb_project mahjong-dl \
-    --wandb_name transformer_sl_server \
+    --save_every 2 --save_interval_min 30 \
+    --wandb --wandb_project mahjong-dl \
     --checkpoint_dir checkpoints/transformer_server \
     --device cuda
 
-# 从断点续训（自动恢复 model/optimizer/scheduler/RNG 状态）
+# 断点续训（自动恢复 model/optimizer/scheduler/RNG/batch 位置）
+./run_resume.sh
+# 或手动:
 python -m training.sl_pretrain \
     --resume checkpoints/transformer_server/sl_resume.pt \
-    --data_format mjson \
-    --random_split_all_mjson dataset/datasets_years \
-    --mjson_years '2021,2022,2023,2024,2025,2026' \
-    --stream_mjson \
-    --model_arch transformer \
-    --epochs 10 --batch_size 256 --lr 3e-4 \
-    --save_every 2 --wandb \
-    --checkpoint_dir checkpoints/transformer_server \
-    --device cuda
+    ... (其他参数同上)
+```
+
+### Step-level Checkpoint（Spot 实例必备）
+
+```bash
+# 每 30 分钟自动保存 sl_resume.pt（断了最多损失 30 分钟）
+--save_interval_min 30
+
+# 每 10000 batches 保存（精确控制）
+--save_interval_batches 10000  # (需在代码中设置)
+
+# 限制训练 batch 数（测试用）
+--max_batches 5000  # 跑 5000 batches 后自动停止
 ```
 
 ### tmux 后台训练（推荐）
 
 ```bash
 tmux new -s train                    # 创建 session
-# 执行训练命令...
+./run_train.sh                       # 执行训练
 # Ctrl+B, D                          # 断开（训练继续运行）
 tmux attach -t train                 # 重新连接
+```
+
+### W&B 策略
+
+```bash
+# 在线模式（默认，需联网）
+export WANDB_MODE=online
+
+# 离线模式（网络不稳时本地记录，训练后手动同步）
+export WANDB_MODE=offline
+# 训练结束后:
+wandb sync wandb/offline-run-*
 ```
 
 ### Checkpoint 说明
 
 | 文件 | 保存时机 | 内容 |
 |------|---------|------|
-| `sl_resume.pt` | 每个 epoch 结束 | 完整续训状态（model + optimizer + scheduler + scaler + RNG） |
+| `sl_resume.pt` | 每个 epoch + 每 N 分钟 | 完整续训状态 + total_batches |
 | `sl_best.pt` | val accuracy 创新高 | 完整续训状态 + best_val_acc |
 | `sl_epoch_NNN.pt` | 每 `--save_every` 个 epoch | 完整续训状态 |
 | `sl_final.pt` | 训练结束 | 完整续训状态 + test 评估结果 |
+| `data_manifest.json` | 首次训练自动生成 | train/val/test 文件列表（可复现） |
+| `benchmark_results.json` | 运行 benchmark 后 | 各配置吞吐量对比 |
 
 ---
 
