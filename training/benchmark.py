@@ -172,28 +172,42 @@ def main():
             else:
                 raise
 
-        # 测试 compile（可选）
+        # 测试 compile（仅 Linux + Triton 可用）
         if not args.no_compile:
-            model2 = TransformerPolicyValueNet(
-                d_model=d_model, n_layers=n_layers, n_heads=n_heads,
-                n_concept=n_concept, max_len=max_len)
-            if sd is not None:
-                model2.load_state_dict(sd)
-            model2 = model2.to(args.device)
-            try:
-                r2 = run_benchmark(model2, args.device, bs, min(args.batches, 200),
-                                   use_amp=True, use_compile=True, max_len=max_len)
-                r2['config'] = f'bs{bs}_compile'
-                results.append(r2)
-                print(f"  +compile: {r2['batch_s']:.1f} batch/s | "
-                      f"{r2['samples_s']:.0f} samples/s | "
-                      f"VRAM {r2['max_vram_gb']:.1f} GB")
-            except RuntimeError as e:
-                if 'out of memory' in str(e).lower():
-                    print(f"  +compile: OOM at batch_size={bs}")
-                    torch.cuda.empty_cache()
-                else:
-                    raise
+            _compile_ok = True
+            _is_windows = sys.platform == 'win32'
+            if _is_windows:
+                print(f"  +compile: skipped (Windows does not support Triton)")
+                _compile_ok = False
+            else:
+                # 检测 Triton 是否安装
+                try:
+                    import triton  # noqa: F401
+                except ImportError:
+                    print(f"  +compile: skipped (Triton not installed, run: pip install triton)")
+                    _compile_ok = False
+
+            if _compile_ok:
+                model2 = TransformerPolicyValueNet(
+                    d_model=d_model, n_layers=n_layers, n_heads=n_heads,
+                    n_concept=n_concept, max_len=max_len)
+                if sd is not None:
+                    model2.load_state_dict(sd)
+                model2 = model2.to(args.device)
+                try:
+                    r2 = run_benchmark(model2, args.device, bs, min(args.batches, 200),
+                                       use_amp=True, use_compile=True, max_len=max_len)
+                    r2['config'] = f'bs{bs}_compile'
+                    results.append(r2)
+                    print(f"  +compile: {r2['batch_s']:.1f} batch/s | "
+                          f"{r2['samples_s']:.0f} samples/s | "
+                          f"VRAM {r2['max_vram_gb']:.1f} GB")
+                except RuntimeError as e:
+                    if 'out of memory' in str(e).lower():
+                        print(f"  +compile: OOM at batch_size={bs}")
+                        torch.cuda.empty_cache()
+                    else:
+                        raise
         print()
 
     # 汇总
