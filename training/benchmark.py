@@ -32,8 +32,8 @@ def run_benchmark(model, device, batch_size, num_batches, use_amp=True,
     model.eval()
     scaler = GradScaler('cuda', enabled=use_amp and device.startswith('cuda'))
 
-    # 生成随机输入
-    seq_len = max_len
+    # 生成随机输入（减掉 concept tokens，避免超过 backbone max_len）
+    seq_len = max_len - 10  # 10 public concept tokens
     token_ids = torch.randint(0, 192, (batch_size, seq_len), device=device)
     token_types = torch.randint(0, 6, (batch_size, seq_len), device=device)
     behavior_ids = torch.randint(0, 64, (batch_size, seq_len), device=device)
