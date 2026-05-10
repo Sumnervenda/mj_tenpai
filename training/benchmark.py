@@ -130,9 +130,6 @@ def main():
         n_concept = args.n_concept
         max_len = args.max_len
         print("No checkpoint provided, using randomly initialized model")
-    n_heads = cfg.get('n_heads', 8)
-    n_concept = cfg.get('n_concept', 10)
-    max_len = cfg.get('max_len', 256)
 
     print(f"Model: d_model={d_model}, n_layers={n_layers}, n_heads={n_heads}, "
           f"n_concept={n_concept}, max_len={max_len}")
