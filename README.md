@@ -43,17 +43,21 @@ mj_tenpai/
 │   ├── transformer_backbone.py      #   Pre-LN Transformer Encoder
 │   ├── multi_task_heads.py          #   6 头 MTL（向听/牌效/危险度/打点/策略/价值）
 │   ├── transformer_policy_value.py  #   Transformer + Concept Token + MTL 完整网络
-│   └── model_io.py                  #   Checkpoint 存取
+│   └── model_io.py                  #   Checkpoint 存取（含断点续训 save/load_resume_checkpoint）
 │
 ├── data/                            # 数据流水线
 │   ├── mjson_parser.py              #   MJSON（雀魂/Tenhou 格式）牌谱解析
 │   ├── oracle.py                    #   Oracle 标签：向听数/进张/待牌质量
-│   ├── record_parser.py            #   训练样本解析 (JSONL → TrainingSample)
-│   ├── dataset.py                   #   PyTorch Dataset + TensorShard
+│   ├── record_parser.py             #   训练样本解析 (JSONL → TrainingSample)
+│   ├── dataset.py                   #   PyTorch Dataset + TensorShard + 流式 IterableDataset
 │   └── data_generator.py            #   内置启发式策略数据生成
 │
 ├── training/                        # 训练脚本
 │   ├── sl_pretrain.py               #   监督学习预训练（从牌谱学策略）
+│   ├── benchmark.py                 #   GPU 短基准测试（batch/s、VRAM、ETA）
+│   ├── agents.py                    #   ResNetAgent / TransformerAgent
+│   ├── distillation.py              #   KL + value MSE 蒸馏 loss
+│   ├── selfplay_recorder.py         #   Oracle 轨迹录制器
 │   ├── ppo_agent.py                 #   PPO 强化学习智能体
 │   ├── rl_selfplay.py               #   自对弈 RL 训练入口
 │   ├── selfplay_env.py              #   引擎 → Gym 环境包装
@@ -62,16 +66,24 @@ mj_tenpai/
 │   ├── reward_shaper.py             #   奖励塑形（Turtle/MadDog/RiichiFund 风格）
 │   └── mjson_cache.py               #   MJSON → TensorShard 缓存构建
 │
+├── scripts/                         # 工具脚本
+│   └── save_manifest.py             #   保存 train/val/test 数据 split manifest
+│
 ├── configs/                         # YAML 配置文件
 │   ├── train_default.yaml           #   默认训练超参数
 │   ├── turtle.yaml                  #   Turtle 风格 RL 配置
 │   ├── mad_dog.yaml                 #   MadDog 风格 RL 配置
-│   └── riichi_fund.yaml            #   RiichiFundamentalist 配置
+│   └── riichi_fund.yaml             #   RiichiFundamentalist 配置
 │
-├── tests/                           # 单元测试（172 个，全部通过）
+├── tests/                           # 单元测试（220 个，全部通过）
 ├── main.py                          # 命令行入口（演示/基准/Live 调试）
 ├── validator.py                     # 牌谱验证脚本
-└── requirements.txt                 # Python 依赖
+├── requirements.txt                 # Python 依赖
+├── requirements-dev.txt             # 开发依赖（pytest）
+├── setup_server.sh                  # 一键 GPU 服务器环境配置
+├── run_benchmark.sh                 # 租卡后快速 GPU 基准测试
+├── run_train.sh                     # 一键启动训练
+└── run_resume.sh                    # 一键断点续训
 ```
 
 ---
@@ -218,12 +230,12 @@ python -m training.iterative_rl \
 git clone git@github.com:Sumnervenda/mj_tenpai.git && cd mj_tenpai
 chmod +x setup_server.sh && ./setup_server.sh
 
-# 2. 上传数据集（推荐打包后上传，避免几十万小文件）
+# 2. 上传数据集（推荐打包后上传，避免 90 万小文件）
 # 本地打包: tar -cf dataset_2021_2026.tar dataset/datasets_years/202[1-6]*
 scp dataset_2021_2026.tar user@server:~/mj_tenpai/
 # 服务器解压: tar -xf dataset_2021_2026.tar
 
-# 3. 先跑短基准（确认 GPU 性能）
+# 3. 先跑短基准（确认 GPU 性能，判断是否换卡）
 chmod +x run_benchmark.sh && ./run_benchmark.sh
 
 # 4. 启动训练（step-level checkpoint 每 30 分钟自动保存）
@@ -236,7 +248,7 @@ chmod +x run_train.sh && ./run_train.sh
 # 跑 1000 batches，输出 batch/s、samples/s、VRAM、预计 epoch 时长
 python -m training.benchmark --checkpoint checkpoints/transformer_server/sl_best.pt
 
-# 自定义 batch sizes
+# 自定义 batch sizes 和数量
 python -m training.benchmark --checkpoint sl_best.pt --sizes 128,256,512 --batches 500
 ```
 
@@ -248,15 +260,19 @@ python -m training.benchmark --checkpoint sl_best.pt --sizes 128,256,512 --batch
 | 20-30 | Good | ~15h |
 | < 20 | 检查配置 | >20h |
 
+若 batch_size=512 不比 256 快，优先用 256（省显存）。若 compile 不提速或 OOM，不用 `--compile`。
+
 ### 数据 Split Manifest（确保可复现）
 
 ```bash
-# 生成 manifest（train/val/test 文件列表）
+# 生成 manifest（train/val/test 文件列表，JSON 格式）
 python scripts/save_manifest.py --root dataset/datasets_years --years 2021-2026
 
 # 使用 manifest 训练（跨机器保证相同 split）
 python -m training.sl_pretrain --manifest dataset/datasets_years/manifest_2021-2026_seed42.json ...
 ```
+
+首次训练时会自动保存 `data_manifest.json` 到 checkpoint 目录。
 
 ### 上传数据集
 
@@ -274,7 +290,7 @@ rsync -avz --progress dataset/datasets_years/ user@server:~/mj_tenpai/dataset/da
 ### 训练命令
 
 ```bash
-# 一键启动训练（脚本内已配置所有参数）
+# 一键启动训练（脚本内已配置所有参数，可直接修改 run_train.sh 头部配置）
 ./run_train.sh
 
 # 手动启动（完整参数）
@@ -289,26 +305,40 @@ python -m training.sl_pretrain \
     --wandb --wandb_project mahjong-dl \
     --checkpoint_dir checkpoints/transformer_server \
     --device cuda
-
-# 断点续训（自动恢复 model/optimizer/scheduler/RNG/batch 位置）
-./run_resume.sh
-# 或手动:
-python -m training.sl_pretrain \
-    --resume checkpoints/transformer_server/sl_resume.pt \
-    ... (其他参数同上)
 ```
 
-### Step-level Checkpoint（Spot 实例必备）
+### 断点续训
+
+```bash
+# 一键续训（自动从 sl_resume.pt 恢复）
+./run_resume.sh
+
+# 手动续训
+python -m training.sl_pretrain \
+    --resume checkpoints/transformer_server/sl_resume.pt \
+    --data_format mjson \
+    --random_split_all_mjson dataset/datasets_years \
+    --mjson_years '2021,2022,2023,2024,2025,2026' \
+    --stream_mjson \
+    --model_arch transformer \
+    --epochs 10 --batch_size 256 --lr 3e-4 \
+    --save_every 2 --save_interval_min 30 \
+    --wandb --checkpoint_dir checkpoints/transformer_server \
+    --device cuda
+```
+
+续训自动恢复：model weights、optimizer state、scheduler state、GradScaler state、RNG states (torch CPU/CUDA + numpy)。
+
+### Step-level Checkpoint（Spot/抢占实例必备）
+
+单 epoch 约 37 小时，step-level checkpoint 避免中断丢失整天进度：
 
 ```bash
 # 每 30 分钟自动保存 sl_resume.pt（断了最多损失 30 分钟）
 --save_interval_min 30
 
-# 每 10000 batches 保存（精确控制）
---save_interval_batches 10000  # (需在代码中设置)
-
-# 限制训练 batch 数（测试用）
---max_batches 5000  # 跑 5000 batches 后自动停止
+# 限制训练 batch 数（快速测试配置是否正确）
+--max_batches 5000
 ```
 
 ### tmux 后台训练（推荐）
@@ -352,6 +382,47 @@ wandb sync wandb/offline-run-*
 - **calculate_shanten**: 标准形 + 七对子 + 国士无双组合向听数
 - **compute_ukeire**: 34 维有效进张布尔掩码 + 剩余牌种计数
 - **classify_wait**: 待牌类型分类（两面/坎张/边张/单骑/双碰/多面）+ 质量评分
+
+---
+
+## sl_pretrain.py 参数速查
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--model_arch` | `resnet` | 模型架构：`resnet` 或 `transformer` |
+| `--data_format` | `jsonl` | 数据格式：`jsonl`、`mjson`、`mjson_cache` |
+| `--random_split_all_mjson` | - | 数据根目录（含年份子目录） |
+| `--mjson_years` | - | 使用的年份，如 `"2021,2022,2023"` |
+| `--stream_mjson` | - | 流式加载（避免 OOM） |
+| `--manifest` | - | 数据 split manifest JSON 路径 |
+| `--epochs` | `10` | 训练 epoch 数 |
+| `--batch_size` | `256` | batch size（256 适配 16GB 显存） |
+| `--lr` | `3e-4` | 学习率 |
+| `--save_every` | `5` | 每 N 个 epoch 保存编号 checkpoint |
+| `--save_interval_min` | `0` | 每 N 分钟保存 step-level checkpoint（0=禁用） |
+| `--max_batches` | `0` | 总 batch 数限制（0=不限制） |
+| `--resume` | - | 断点续训 checkpoint 路径 |
+| `--wandb` | - | 启用 Weights & Biases 日志 |
+| `--wandb_project` | `mahjong-dl` | W&B 项目名 |
+| `--wandb_name` | - | W&B 实验名 |
+| `--device` | `cuda` | 设备：`cuda` 或 `cpu` |
+| `--no_amp` | - | 禁用混合精度训练 |
+| `--compile` | - | 使用 `torch.compile` 加速 |
+| `--teacher_mode` | - | 启用 Teacher-Student 蒸馏 |
+| `--teacher_checkpoint` | - | 冻结 Teacher 模型路径 |
+| `--oracle_data` | - | Oracle 轨迹 JSONL 路径 |
+
+---
+
+## benchmark.py 参数速查
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--checkpoint` | (必填) | 模型 checkpoint 路径 |
+| `--batches` | `1000` | 每个配置跑的 batch 数 |
+| `--sizes` | `128,256,512` | 测试的 batch sizes |
+| `--device` | `cuda` | 设备 |
+| `--no_compile` | - | 跳过 `torch.compile` 测试 |
 
 ---
 
