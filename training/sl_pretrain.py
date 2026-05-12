@@ -40,6 +40,7 @@ from data import (
     MJSONPublicPrivateTokenIterableDataset,
     TensorShardBatchDataset,
     TokenShardBatchDataset,
+    TokenMmapShardBatchDataset,
     TokenDataset,
     collate_transformer_batch,
 )
@@ -53,6 +54,8 @@ from training.mjson_cache import (
 from training.mjson_token_cache import (
     load_token_cache_manifest,
     token_shard_paths_for_split,
+    load_token_mmap_cache_manifest,
+    token_mmap_shards_for_split,
 )
 
 
@@ -517,6 +520,10 @@ def parse_args():
     parser.add_argument('--mjson_token_cache', type=str, default=None,
                         help='Directory containing prebuilt MJSON token shards '
                              '(Transformer only, built via training.mjson_token_cache)')
+    parser.add_argument('--mjson_token_mmap', type=str, default=None,
+                        help='Directory containing compact mmap MJSON token shards '
+                             '(Transformer only, built via training.mjson_token_cache build-mmap '
+                             'or convert-mmap)')
     parser.add_argument('--build_mjson_cache', action='store_true',
                         help='Build MJSON tensor shards before training, or build and exit when data_format is not mjson_cache')
     parser.add_argument('--cache_shard_size', type=int, default=65536,
@@ -1607,6 +1614,56 @@ def main():
         test_set = OracleTrajectoryIterableDataset(
             test_files, shuffle_files=False, seed=args.split_seed)
 
+    elif args.mjson_token_mmap:
+        if not is_transformer:
+            raise ValueError(
+                '--mjson_token_mmap requires --model_arch transformer. '
+                'Token mmap caches store token sequences, not state vectors.')
+        token_mmap_manifest = load_token_mmap_cache_manifest(args.mjson_token_mmap)
+        streaming_mode = True
+        prebatched_mode = True
+        train_split = token_mmap_manifest['splits']['train']
+        val_split = token_mmap_manifest['splits']['val']
+        test_split = token_mmap_manifest['splits']['test']
+        train_set = TokenMmapShardBatchDataset(
+            args.mjson_token_mmap,
+            token_mmap_shards_for_split(
+                args.mjson_token_mmap, token_mmap_manifest, 'train'),
+            batch_size=args.batch_size,
+            shuffle_shards=True,
+            shuffle_samples=True,
+            drop_last=True,
+            seed=args.split_seed,
+            total_samples=int(train_split.get('num_samples', 0)),
+        )
+        val_set = TokenMmapShardBatchDataset(
+            args.mjson_token_mmap,
+            token_mmap_shards_for_split(
+                args.mjson_token_mmap, token_mmap_manifest, 'val'),
+            batch_size=args.batch_size,
+            shuffle_shards=False,
+            shuffle_samples=False,
+            drop_last=False,
+            seed=args.split_seed,
+            total_samples=int(val_split.get('num_samples', 0)),
+        )
+        test_set = TokenMmapShardBatchDataset(
+            args.mjson_token_mmap,
+            token_mmap_shards_for_split(
+                args.mjson_token_mmap, token_mmap_manifest, 'test'),
+            batch_size=args.batch_size,
+            shuffle_shards=False,
+            shuffle_samples=False,
+            drop_last=False,
+            seed=args.split_seed,
+            total_samples=int(test_split.get('num_samples', 0)),
+        )
+        print(
+            f"Token mmap cache split: "
+            f"train={train_split['num_samples']}, "
+            f"val={val_split['num_samples']}, "
+            f"test={test_split['num_samples']} samples"
+        )
     elif args.mjson_token_cache:
         if not is_transformer:
             raise ValueError(
@@ -1969,6 +2026,7 @@ def main():
         try:
             import wandb
             run_name = args.wandb_name or f"sl_{Path(args.checkpoint_dir).name}"
+            wandb_mode = os.environ.get("WANDB_MODE", "online")
             wandb_run = wandb.init(
                 project=args.wandb_project,
                 name=run_name,
@@ -1981,6 +2039,8 @@ def main():
                     'data_format': args.data_format,
                     'mjson_years': args.mjson_years,
                     'mjson_cache_dir': args.mjson_cache_dir,
+                    'mjson_token_cache': args.mjson_token_cache,
+                    'mjson_token_mmap': args.mjson_token_mmap,
                     'cache_shard_size': args.cache_shard_size,
                     'cache_state_dtype': args.cache_state_dtype,
                     'prebatched': prebatched_mode,
@@ -2009,7 +2069,7 @@ def main():
                 },
                 reinit="finish_previous",
                 settings=wandb.Settings(
-                    mode="online",
+                    mode=wandb_mode,
                     init_timeout=120,
                 ),
             )

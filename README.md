@@ -65,7 +65,7 @@ mj_tenpai/
 │   ├── heuristic_agent.py           #   启发式基线智能体
 │   ├── reward_shaper.py             #   奖励塑形（Turtle/MadDog/RiichiFund 风格）
 │   ├── mjson_cache.py               #   MJSON → TensorShard 缓存构建
-│   └── mjson_token_cache.py         #   MJSON → Token 序列缓存构建（Transformer 专用）
+│   └── mjson_token_cache.py         #   MJSON → Token 缓存构建（.npz / compact mmap）
 │
 ├── scripts/                         # 工具脚本
 │   └── save_manifest.py             #   保存 train/val/test 数据 split manifest
@@ -238,19 +238,19 @@ chmod +x setup_server.sh && ./setup_server.sh
 scp dataset_2021_2026.tar user@server:~/mj_tenpai/
 # 服务器解压: tar -xf dataset_2021_2026.tar
 
-# 3. 构建 Transformer token cache（训练阶段不再解析 mjson）
-python -m training.mjson_token_cache build \
+# 3. 构建 Transformer compact mmap token cache（训练阶段不再解析 mjson）
+python -m training.mjson_token_cache build-mmap \
     --source dataset/datasets_years \
-    --cache dataset/token_cache_2021-2026 \
+    --cache dataset/token_mmap_2021-2026 \
     --years 2021,2022,2023,2024,2025,2026 \
     --num_workers 16 \
-    --shard_size 10000
+    --shard_size 200000
 
 # 4. 先跑短基准（确认 GPU 性能，判断是否换卡）
 chmod +x run_benchmark.sh && ./run_benchmark.sh
 
-# 5. 启动训练（默认使用 token cache；step-level checkpoint 每 30 分钟自动保存）
-chmod +x run_train.sh && ./run_train.sh
+# 5. 启动训练（使用 mmap cache；step-level checkpoint 每 30 分钟自动保存）
+chmod +x run_train.sh && DATA_MODE=token_mmap ./run_train.sh
 ```
 
 ### 短基准脚本（租卡后第一步）
@@ -277,8 +277,41 @@ python -m training.benchmark --checkpoint sl_best.pt --sizes 128,256,512 --batch
 
 训练时每 epoch 重复解析 mjson → 回放对局 → tokenization 420M 样本，CPU 成为瓶颈。**Token 缓存**将 tokenization 结果预先计算并压缩存储，训练时直接加载，数据读取速度提升 10-50x。
 
+#### compact mmap 格式（推荐云端训练）
+
+`token_mmap` 使用 ragged flat mmap：token 序列按真实长度连续存储，`action_mask` 按 bit 打包为 10 bytes/sample，训练时按 batch 动态 padding。它通常比“未压缩 padded mmap”小得多，文件数量也远少于 `.npz` shard，适合打包上传到云端后本地磁盘训练。
+
 ```bash
-# 1. 构建 token 缓存（一次性，推荐 --num_workers 16-32 充分利用 CPU）
+# 从原始 mjson 直接构建 mmap cache
+python -m training.mjson_token_cache build-mmap \
+    --source dataset/datasets_years \
+    --cache dataset/token_mmap_2021-2026 \
+    --years 2021,2022,2023,2024,2025,2026 \
+    --num_workers 16 \
+    --shard_size 200000
+
+# 如果已经有旧版 .npz token cache，可直接转换
+python -m training.mjson_token_cache convert-mmap \
+    --source_cache dataset/token_cache_2021-2026 \
+    --cache dataset/token_mmap_2021-2026 \
+    --shard_size 200000
+
+# 查看缓存信息
+python -m training.mjson_token_cache info --cache dataset/token_mmap_2021-2026
+
+# 使用 mmap cache 训练
+python -m training.sl_pretrain \
+    --mjson_token_mmap dataset/token_mmap_2021-2026 \
+    --model_arch transformer \
+    --epochs 10 --batch_size 512 --lr 3e-4 \
+    --wandb --checkpoint_dir checkpoints/transformer_2021-2026 \
+    --device cuda
+```
+
+#### .npz 压缩格式（兼容旧流程）
+
+```bash
+# 构建 .npz token 缓存（一次性，推荐 --num_workers 16-32 充分利用 CPU）
 python -m training.mjson_token_cache build \
     --source dataset/datasets_years \
     --cache dataset/token_cache_2021-2026 \
@@ -298,6 +331,17 @@ python -m training.sl_pretrain \
 ```
 
 **存储估算**：~13 GB / 420M 样本（int16 + zlib 压缩，约为原始 mjson 的 10%）。通过长度分桶（5 个桶: 1-80, 81-120, 121-160, 161-200, 201-256）最小化 padding 浪费。
+
+**注意**：mmap 格式不是“压缩文件”，它主要解决训练时随机访问和文件数量问题；最终体积取决于平均 token 长度。上传前可用 `tar`/`zstd`/`rsync --partial` 打包或断点续传。
+
+### 云端直接读取本地数据？
+
+可以用 SSHFS、rclone mount、Tailscale/ZeroTier + 文件共享等方式让云端挂载本地目录，但不推荐用于长训：训练会持续随机读取 shard，公网延迟和家用上行带宽很容易让 GPU 等数据。更稳的方案是：
+
+- 用 `rsync -avP --partial` 把 `dataset/token_mmap_2021-2026/` 断点续传到云端。
+- 本地打包 `tar` 后让云端 `wget -c` / `aria2c` 拉取。
+- 上传到对象存储（S3/R2/OSS），云端从同区域对象存储下载。
+- 如果云端 CPU/磁盘便宜，上传原始 mjson tar 后在云端执行 `build-mmap`。
 
 **注意**：Token 缓存仅支持 `--model_arch transformer`。ResNet 使用 `--mjson_cache_dir` 和 `--data_format mjson_cache`。
 
@@ -435,6 +479,7 @@ wandb sync wandb/offline-run-*
 | `--stream_mjson` | - | 流式加载（避免 OOM） |
 | `--manifest` | - | 数据 split manifest JSON 路径 |
 | `--mjson_token_cache` | - | Token 缓存目录（Transformer only，替代流式解析） |
+| `--mjson_token_mmap` | - | Compact mmap Token 缓存目录（Transformer only，推荐云端训练） |
 | `--mjson_cache_dir` | - | ResNet tensor 缓存目录（`data_format=mjson_cache` 时使用） |
 | `--build_mjson_cache` | - | 构建 ResNet tensor 缓存 |
 | `--epochs` | `10` | 训练 epoch 数 |
@@ -466,6 +511,8 @@ wandb sync wandb/offline-run-*
 | `--device` | `cuda` | 设备 |
 | `--no_compile` | - | 跳过 `torch.compile` 测试 |
 | `--output` | 自动 | JSON 结果输出路径；`none` 表示不写文件 |
+| `--mjson_token_cache` | - | 使用 .npz token cache 做真实 forward/backward dry-run |
+| `--mjson_token_mmap` | - | 使用 mmap token cache 做真实 forward/backward dry-run |
 
 ---
 

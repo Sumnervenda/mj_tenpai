@@ -17,13 +17,22 @@ import sys
 import time
 
 import torch
+import torch.nn as nn
 from torch.amp import autocast
+from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from models.model_io import load_checkpoint_metadata, infer_transformer_config_from_state_dict
 from models.tokenizer import TokenType, TokenVocab
 from models.transformer_policy_value import TransformerPolicyValueNet
+from data.dataset import TokenShardBatchDataset, TokenMmapShardBatchDataset
+from training.mjson_token_cache import (
+    load_token_cache_manifest,
+    token_shard_paths_for_split,
+    load_token_mmap_cache_manifest,
+    token_mmap_shards_for_split,
+)
 
 
 def run_benchmark(model, device, batch_size, num_batches, use_amp=True,
@@ -108,6 +117,115 @@ def run_benchmark(model, device, batch_size, num_batches, use_amp=True,
     }
 
 
+def run_real_cache_benchmark(model_factory, device, batch_size, num_batches,
+                             cache_dir, cache_kind, split='train',
+                             use_amp=True, warmup_batches=5):
+    """Benchmark forward+loss+backward using real token cache batches."""
+    amp_enabled = bool(use_amp and device.startswith('cuda'))
+    if cache_kind == 'mmap':
+        manifest = load_token_mmap_cache_manifest(cache_dir)
+        split_info = manifest['splits'][split]
+        dataset = TokenMmapShardBatchDataset(
+            cache_dir,
+            token_mmap_shards_for_split(cache_dir, manifest, split),
+            batch_size=batch_size,
+            shuffle_shards=False,
+            shuffle_samples=False,
+            drop_last=True,
+            seed=42,
+            total_samples=int(split_info.get('num_samples', 0)),
+        )
+    else:
+        manifest = load_token_cache_manifest(cache_dir)
+        split_info = manifest['splits'][split]
+        dataset = TokenShardBatchDataset(
+            token_shard_paths_for_split(cache_dir, manifest, split),
+            batch_size=batch_size,
+            shuffle_shards=False,
+            shuffle_samples=False,
+            drop_last=True,
+            seed=42,
+        )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=None,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=device.startswith('cuda'),
+    )
+    model = model_factory().to(device)
+    model.train()
+    criterion = nn.CrossEntropyLoss()
+    if device.startswith('cuda'):
+        torch.cuda.reset_peak_memory_stats()
+
+    measured = 0
+    seen = 0
+    total_loss = 0.0
+    start = None
+    seq_len = 0
+    for batch_idx, batch in enumerate(loader):
+        token_ids = batch['token_ids'].to(device, non_blocking=True)
+        token_types = batch['token_types'].to(device, non_blocking=True)
+        behavior_ids = batch['behavior_ids'].to(device, non_blocking=True)
+        attention_mask = batch['attention_mask'].to(device, non_blocking=True)
+        action_mask = batch['action_mask'].to(
+            device, dtype=torch.float32, non_blocking=True)
+        labels = batch['labels'].to(device, non_blocking=True)
+        seq_len = int(token_ids.shape[1])
+
+        model.zero_grad(set_to_none=True)
+        with autocast('cuda', enabled=amp_enabled):
+            outputs = model(token_ids, token_types, behavior_ids,
+                            attention_mask, action_mask)
+            loss = criterion(outputs['policy_logits'], labels)
+        loss.backward()
+        if device.startswith('cuda'):
+            torch.cuda.synchronize()
+
+        if warmup_batches <= 0 and start is None:
+            start = time.time()
+        if warmup_batches > 0 and batch_idx + 1 == warmup_batches:
+            start = time.time()
+            measured = 0
+            seen = 0
+            total_loss = 0.0
+        elif batch_idx + 1 > warmup_batches:
+            measured += 1
+            seen += int(labels.shape[0])
+            total_loss += float(loss.detach().cpu())
+            if measured >= num_batches:
+                break
+
+    if start is None or measured == 0:
+        raise RuntimeError(
+            f"Not enough batches in {cache_kind} cache split {split!r} "
+            f"for warmup={warmup_batches}, batches={num_batches}")
+
+    elapsed = time.time() - start
+    samples_s = seen / elapsed
+    batch_s = measured / elapsed
+    max_mem_gb = (torch.cuda.max_memory_allocated() / 1024**3
+                  if device.startswith('cuda') else 0)
+    split_samples = int(split_info.get('num_samples', 0))
+    est_epoch_hours = split_samples / samples_s / 3600
+    return {
+        'batch_size': batch_size,
+        'num_batches': measured,
+        'elapsed_sec': round(elapsed, 2),
+        'batch_s': round(batch_s, 2),
+        'samples_s': round(samples_s, 0),
+        'max_vram_gb': round(max_mem_gb, 2),
+        'est_epoch_hours': round(est_epoch_hours, 1),
+        'avg_loss': round(total_loss / measured, 4),
+        'use_amp': amp_enabled,
+        'cache_kind': cache_kind,
+        'split': split,
+        'seq_len_last_batch': seq_len,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description='GPU benchmark for Transformer training')
     parser.add_argument('--checkpoint', type=str, default=None,
@@ -132,6 +250,15 @@ def main():
                              'checkpoint whose metadata lacks n_heads.')
     parser.add_argument('--n_concept', type=int, default=10)
     parser.add_argument('--max_len', type=int, default=256)
+    parser.add_argument('--mjson_token_cache', type=str, default=None,
+                        help='Run train-like benchmark on compressed token cache')
+    parser.add_argument('--mjson_token_mmap', type=str, default=None,
+                        help='Run train-like benchmark on compact mmap token cache')
+    parser.add_argument('--real_split', type=str, default='train',
+                        choices=['train', 'val', 'test'],
+                        help='Cache split for train-like benchmark')
+    parser.add_argument('--real_warmup_batches', type=int, default=5,
+                        help='Warmup batches for train-like benchmark')
     args = parser.parse_args()
 
     if args.device.startswith('cuda') and not torch.cuda.is_available():
@@ -186,6 +313,74 @@ def main():
 
     batch_sizes = [int(x) for x in args.sizes.split(',')]
     results = []
+
+    if args.mjson_token_cache and args.mjson_token_mmap:
+        raise ValueError('Pass only one of --mjson_token_cache or --mjson_token_mmap')
+
+    if args.mjson_token_cache or args.mjson_token_mmap:
+        cache_dir = args.mjson_token_mmap or args.mjson_token_cache
+        cache_kind = 'mmap' if args.mjson_token_mmap else 'npz'
+
+        def _model_factory():
+            m = TransformerPolicyValueNet(
+                d_model=d_model, n_layers=n_layers, n_heads=n_heads,
+                n_concept=n_concept, max_len=max_len)
+            if sd is not None:
+                m.load_state_dict(sd)
+            return m
+
+        print(f"Real cache benchmark: kind={cache_kind}, split={args.real_split}, "
+              f"cache={cache_dir}")
+        for bs in batch_sizes:
+            print(f"--- real batch_size={bs}, batches={args.batches} ---", flush=True)
+            try:
+                r = run_real_cache_benchmark(
+                    _model_factory,
+                    args.device,
+                    bs,
+                    args.batches,
+                    cache_dir,
+                    cache_kind,
+                    split=args.real_split,
+                    use_amp=True,
+                    warmup_batches=args.real_warmup_batches,
+                )
+                results.append(r)
+                print(f"  {r['batch_s']:.1f} batch/s | "
+                      f"{r['samples_s']:.0f} samples/s | "
+                      f"VRAM {r['max_vram_gb']:.1f} GB | "
+                      f"ETA {args.real_split} epoch ~{r['est_epoch_hours']:.1f}h | "
+                      f"loss {r['avg_loss']:.4f}")
+            except RuntimeError as e:
+                if 'out of memory' in str(e).lower():
+                    print(f"  OOM at batch_size={bs}, skipping")
+                    torch.cuda.empty_cache()
+                else:
+                    raise
+            print()
+
+        print("=" * 86)
+        print(f"{'Config':<18} {'cache':<8} {'batch/s':>10} {'samples/s':>12} "
+              f"{'VRAM GB':>10} {'ETA split':>12} {'loss':>10}")
+        print("-" * 86)
+        for r in results:
+            cfg_name = f"bs{r['batch_size']}"
+            print(f"{cfg_name:<18} {r['cache_kind']:<8} {r['batch_s']:>10.1f} "
+                  f"{r['samples_s']:>12.0f} {r['max_vram_gb']:>10.2f} "
+                  f"{r['est_epoch_hours']:>10.1f}h {r['avg_loss']:>10.4f}")
+        print("=" * 86)
+
+        if args.output is not None and args.output.lower() in {'none', 'skip', '-'}:
+            print("\nResults not written (--output none)")
+        else:
+            out_path = args.output or os.path.join(cache_dir, 'benchmark_results.json')
+            out_dir = os.path.dirname(out_path)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            with open(out_path, 'w') as f:
+                json.dump(results, f, indent=2)
+            print(f"\nResults saved to {out_path}")
+        return
 
     for bs in batch_sizes:
         print(f"--- batch_size={bs}, batches={args.batches} ---", flush=True)

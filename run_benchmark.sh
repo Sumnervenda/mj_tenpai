@@ -17,6 +17,9 @@ SIZES="${BENCHMARK_SIZES:-128,256,512}"
 DEVICE="${BENCHMARK_DEVICE:-cuda}"
 NO_COMPILE="${BENCHMARK_NO_COMPILE:-0}"
 OUTPUT="${BENCHMARK_OUTPUT:-}"
+TOKEN_CACHE_DIR="${BENCHMARK_TOKEN_CACHE:-}"
+TOKEN_MMAP_DIR="${BENCHMARK_TOKEN_MMAP:-}"
+REAL_SPLIT="${BENCHMARK_REAL_SPLIT:-train}"
 
 if [ -d ".venv" ] && [ -z "${VIRTUAL_ENV:-}" ]; then
     # shellcheck disable=SC1091
@@ -48,6 +51,16 @@ if [ "$NO_COMPILE" = "1" ]; then
 fi
 if [ -n "$OUTPUT" ]; then
     BENCH_ARGS+=(--output "$OUTPUT")
+fi
+if [ -n "$TOKEN_CACHE_DIR" ] && [ -n "$TOKEN_MMAP_DIR" ]; then
+    echo "Error: set only one of BENCHMARK_TOKEN_CACHE or BENCHMARK_TOKEN_MMAP" >&2
+    exit 1
+fi
+if [ -n "$TOKEN_CACHE_DIR" ]; then
+    BENCH_ARGS+=(--mjson_token_cache "$TOKEN_CACHE_DIR" --real_split "$REAL_SPLIT")
+fi
+if [ -n "$TOKEN_MMAP_DIR" ]; then
+    BENCH_ARGS+=(--mjson_token_mmap "$TOKEN_MMAP_DIR" --real_split "$REAL_SPLIT")
 fi
 echo ""
 

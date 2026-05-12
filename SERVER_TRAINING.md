@@ -22,28 +22,37 @@ scp dataset_2021_2026.tar user@server:~/mj_tenpai/
 tar -xf dataset_2021_2026.tar
 ```
 
-构建 Transformer token cache。这个步骤只需要做一次；训练阶段会直接读 token shard，不再解析 mjson。
+构建 Transformer compact mmap token cache。这个步骤只需要做一次；训练阶段会直接读 token mmap shard，不再解析 mjson。
 
 ```bash
-python -m training.mjson_token_cache build \
+python -m training.mjson_token_cache build-mmap \
   --source dataset/datasets_years \
-  --cache dataset/token_cache_2021-2026 \
+  --cache dataset/token_mmap_2021-2026 \
   --years 2021,2022,2023,2024,2025,2026 \
   --num_workers 16 \
-  --shard_size 10000
+  --shard_size 200000
 
-python -m training.mjson_token_cache info --cache dataset/token_cache_2021-2026
+python -m training.mjson_token_cache info --cache dataset/token_mmap_2021-2026
+```
+
+如果已经在本地构建了旧版 `.npz` token cache，可以先转换成 mmap 再上传：
+
+```bash
+python -m training.mjson_token_cache convert-mmap \
+  --source_cache dataset/token_cache_2021-2026 \
+  --cache dataset/token_mmap_2021-2026 \
+  --shard_size 200000
 ```
 
 如果上一次 cache 构建中断，直接覆盖重建：
 
 ```bash
-python -m training.mjson_token_cache build \
+python -m training.mjson_token_cache build-mmap \
   --source dataset/datasets_years \
-  --cache dataset/token_cache_2021-2026 \
+  --cache dataset/token_mmap_2021-2026 \
   --years 2021,2022,2023,2024,2025,2026 \
   --num_workers 16 \
-  --shard_size 10000 \
+  --shard_size 200000 \
   --overwrite
 ```
 
@@ -51,7 +60,7 @@ python -m training.mjson_token_cache build \
 
 ```bash
 ./run_benchmark.sh
-./run_train.sh
+DATA_MODE=token_mmap ./run_train.sh
 ```
 
 断点续训：
@@ -70,9 +79,10 @@ python -m training.mjson_token_cache build \
 BATCH_SIZE=512 EPOCHS=20 ./run_train.sh
 USE_WANDB=0 ./run_train.sh
 DATA_MODE=stream_mjson ./run_train.sh
+DATA_MODE=token_mmap ./run_train.sh
 AUTO_BUILD_TOKEN_CACHE=1 ./run_train.sh
 AUTO_BUILD_TOKEN_CACHE=1 CACHE_OVERWRITE=1 ./run_train.sh
-BENCHMARK_SIZES=128,256 BENCHMARK_BATCHES=200 ./run_benchmark.sh
+BENCHMARK_TOKEN_MMAP=dataset/token_mmap_2021-2026 BENCHMARK_SIZES=256,512 BENCHMARK_BATCHES=100 ./run_benchmark.sh
 RUN_TESTS=0 ./setup_server.sh
 TORCH_CUDA_TAG=cu124 ./setup_server.sh
 ALLOW_CPU=1 ./setup_server.sh
@@ -84,9 +94,11 @@ ALLOW_CPU=1 ./setup_server.sh
 |---|---|---|
 | `DATA_DIR` | `dataset/datasets_years` | mjson 年份目录 |
 | `TOKEN_CACHE_DIR` | `dataset/token_cache_2021-2026` | token cache 输出/读取目录 |
-| `DATA_MODE` | `token_cache` | `token_cache` 或 `stream_mjson` |
+| `TOKEN_MMAP_DIR` | `dataset/token_mmap_2021-2026` | compact mmap token cache 目录 |
+| `DATA_MODE` | `token_cache` | `token_mmap`、`token_cache` 或 `stream_mjson` |
 | `AUTO_BUILD_TOKEN_CACHE` | `0` | cache 不存在时是否自动构建 |
 | `CACHE_OVERWRITE` | `0` | 自动构建 cache 时是否覆盖旧 cache |
+| `MMAP_SHARD_SIZE` | `200000` | 每个 mmap shard 的样本数 |
 | `YEARS` | `2021,2022,2023,2024,2025,2026` | 使用的年份 |
 | `BATCH_SIZE` | `256` | 训练 batch size |
 | `SAVE_INTERVAL_MIN` | `30` | step-level checkpoint 间隔 |
@@ -99,16 +111,30 @@ ALLOW_CPU=1 ./setup_server.sh
 
 `token cache manifest is incomplete`：cache 构建中断过，manifest 只写了一部分。用 `--overwrite` 或 `CACHE_OVERWRITE=1` 重建。
 
+`token mmap cache 不存在`：先用 `convert-mmap` 从旧 `.npz` cache 转换，或设置 `DATA_MODE=token_mmap AUTO_BUILD_TOKEN_CACHE=1 ./run_train.sh` 让脚本自动转换/构建。
+
 `run_benchmark.sh checkpoint not found`：脚本现在会直接失败，不会静默改用随机模型。确认路径，或者不传参数来测随机初始化模型。
 
 训练开始前就退出并提示 `token cache 未完成`：这是预期行为。默认训练走 `token_cache`，目的是避免长训时反复解析 mjson。临时测试可用 `DATA_MODE=stream_mjson ./run_train.sh`。
 
 W&B 登录失败：不想联网就用 `USE_WANDB=0 ./run_train.sh`；想离线记录就设置 `WANDB_MODE=offline`，训练后再 `wandb sync wandb/offline-run-*`。
 
+## 云端读取本地数据
+
+能做，但不建议直接用于长训。SSHFS、rclone mount、Tailscale/ZeroTier 共享盘都能让云端“看到”你本地目录，可训练会持续随机读 batch，公网延迟和上行带宽会让 GPU 长时间等数据。
+
+推荐顺序：
+
+1. `rsync -avP --partial dataset/token_mmap_2021-2026/ user@server:~/mj_tenpai/dataset/token_mmap_2021-2026/`
+2. 本地 `tar` 打包后开 HTTP 服务，云端 `wget -c`/`aria2c` 断点下载。
+3. 上传对象存储（S3/R2/OSS），云端从同区域下载。
+4. 只上传原始 mjson tar，在云端执行 `build-mmap`。
+
 ## 快速体检命令
 
 ```bash
 bash -n setup_server.sh run_train.sh run_resume.sh run_benchmark.sh
 python -m training.benchmark --device cpu --batches 1 --sizes 1 --no_compile --output none
+python -m training.benchmark --device cpu --mjson_token_mmap dataset/token_mmap_2021-2026 --batches 1 --sizes 2 --real_warmup_batches 0 --output none
 python -m pytest tests -q -p no:cacheprovider
 ```

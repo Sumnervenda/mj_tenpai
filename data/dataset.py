@@ -433,6 +433,145 @@ class TokenShardBatchDataset(IterableDataset):
         if self.drop_last:
             return total // self.batch_size
         return math.ceil(total / self.batch_size)
+
+
+class TokenMmapShardBatchDataset(IterableDataset):
+    """Stream pre-tokenized batches from compact mmap token shards.
+
+    The mmap format stores ragged token sequences as flat uint8 arrays plus
+    per-sample offsets. Batches are padded on the fly to the longest sequence
+    in that batch, and action masks are unpacked from 10-byte bitsets.
+    """
+
+    def __init__(self,
+                 cache_dir: str,
+                 shard_specs: Sequence[Dict[str, object]],
+                 batch_size: int,
+                 shuffle_shards: bool = False,
+                 shuffle_samples: bool = False,
+                 drop_last: bool = False,
+                 seed: int = 42,
+                 total_samples: Optional[int] = None):
+        super().__init__()
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        self.cache_dir = str(cache_dir)
+        self.shard_specs = [dict(s) for s in shard_specs]
+        self.batch_size = batch_size
+        self.shuffle_shards = shuffle_shards
+        self.shuffle_samples = shuffle_samples
+        self.drop_last = drop_last
+        self.seed = seed
+        self.epoch = 0
+        self.total_samples = total_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def _open_shard(self, spec: Dict[str, object]):
+        from pathlib import Path
+
+        shard_dir = Path(self.cache_dir) / str(spec["path"])
+        files = spec.get("files", {})
+        n = int(spec["samples"])
+        tokens = int(spec["tokens"])
+        return {
+            "token_ids": np.memmap(
+                shard_dir / files["token_ids"], dtype=np.uint8,
+                mode="r", shape=(tokens,)),
+            "token_types": np.memmap(
+                shard_dir / files["token_types"], dtype=np.uint8,
+                mode="r", shape=(tokens,)),
+            "behavior_ids": np.memmap(
+                shard_dir / files["behavior_ids"], dtype=np.uint8,
+                mode="r", shape=(tokens,)),
+            "offsets": np.memmap(
+                shard_dir / files["offsets"], dtype=np.uint32,
+                mode="r", shape=(n + 1,)),
+            "action_mask": np.memmap(
+                shard_dir / files["action_mask"], dtype=np.uint8,
+                mode="r", shape=(n, 10)),
+            "labels": np.memmap(
+                shard_dir / files["labels"], dtype=np.uint8,
+                mode="r", shape=(n,)),
+        }
+
+    def __iter__(self):
+        specs = list(self.shard_specs)
+        rng = np.random.default_rng(self.seed + self.epoch)
+        if self.shuffle_shards:
+            rng.shuffle(specs)
+
+        worker = get_worker_info()
+        if worker is not None:
+            specs = specs[worker.id::worker.num_workers]
+
+        for spec in specs:
+            arrays = self._open_shard(spec)
+            n = int(spec["samples"])
+            if n == 0:
+                continue
+
+            order = None
+            if self.shuffle_samples:
+                order = rng.permutation(n)
+
+            for start in range(0, n, self.batch_size):
+                end = min(start + self.batch_size, n)
+                if self.drop_last and end - start < self.batch_size:
+                    continue
+                if order is None:
+                    sample_indices = np.arange(start, end, dtype=np.int64)
+                else:
+                    sample_indices = order[start:end].astype(np.int64, copy=False)
+
+                offsets = arrays["offsets"]
+                starts = offsets[sample_indices].astype(np.int64, copy=False)
+                stops = offsets[sample_indices + 1].astype(np.int64, copy=False)
+                lengths = stops - starts
+                if lengths.size == 0:
+                    continue
+                max_len = int(lengths.max())
+                batch_n = int(lengths.shape[0])
+
+                token_ids = np.zeros((batch_n, max_len), dtype=np.int64)
+                token_types = np.zeros((batch_n, max_len), dtype=np.int64)
+                behavior_ids = np.zeros((batch_n, max_len), dtype=np.int64)
+                attention_mask = np.ones((batch_n, max_len), dtype=bool)
+
+                for row, (tok_start, tok_stop) in enumerate(zip(starts, stops)):
+                    seq_len = int(tok_stop - tok_start)
+                    if seq_len <= 0:
+                        continue
+                    sl = slice(int(tok_start), int(tok_stop))
+                    token_ids[row, :seq_len] = arrays["token_ids"][sl]
+                    token_types[row, :seq_len] = arrays["token_types"][sl]
+                    behavior_ids[row, :seq_len] = arrays["behavior_ids"][sl]
+                    attention_mask[row, :seq_len] = False
+
+                packed_masks = np.asarray(arrays["action_mask"][sample_indices])
+                action_mask = np.unpackbits(
+                    packed_masks, axis=1, count=77, bitorder="little"
+                ).astype(np.float32, copy=False)
+                labels = np.asarray(arrays["labels"][sample_indices],
+                                    dtype=np.int64)
+
+                yield {
+                    "token_ids": torch.from_numpy(token_ids),
+                    "token_types": torch.from_numpy(token_types),
+                    "behavior_ids": torch.from_numpy(behavior_ids),
+                    "attention_mask": torch.from_numpy(attention_mask),
+                    "action_mask": torch.from_numpy(action_mask),
+                    "labels": torch.from_numpy(labels),
+                }
+
+    def __len__(self) -> int:
+        total = self.total_samples
+        if total is None:
+            total = sum(int(s.get("samples", 0)) for s in self.shard_specs)
+        if self.drop_last:
+            return int(total) // self.batch_size
+        return math.ceil(int(total) / self.batch_size)
 # 中文注释：PyTorch 数据集封装，连接牌谱解析结果和监督学习 DataLoader。
 
 
