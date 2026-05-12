@@ -39,6 +39,7 @@ from data import (
     MJSONTokenIterableDataset,
     MJSONPublicPrivateTokenIterableDataset,
     TensorShardBatchDataset,
+    TokenShardBatchDataset,
     TokenDataset,
     collate_transformer_batch,
 )
@@ -48,6 +49,10 @@ from training.mjson_cache import (
     load_mjson_cache_manifest,
     shard_paths_for_split,
     split_mjson_files as split_mjson_files_fast,
+)
+from training.mjson_token_cache import (
+    load_token_cache_manifest,
+    token_shard_paths_for_split,
 )
 
 
@@ -195,7 +200,7 @@ def make_dataloader(dataset, batch_size: int, shuffle: bool, drop_last: bool,
         kwargs["batch_size"] = batch_size
         kwargs["shuffle"] = shuffle
         kwargs["drop_last"] = drop_last
-    if collate_fn is not None:
+    if collate_fn is not None and not prebatched:
         kwargs["collate_fn"] = collate_fn
     if num_workers > 0:
         kwargs["persistent_workers"] = use_cuda
@@ -509,6 +514,9 @@ def parse_args():
                         help='Stream MJSON samples from files instead of loading all into memory')
     parser.add_argument('--mjson_cache_dir', type=str, default=None,
                         help='Directory containing or receiving prebuilt MJSON tensor shards')
+    parser.add_argument('--mjson_token_cache', type=str, default=None,
+                        help='Directory containing prebuilt MJSON token shards '
+                             '(Transformer only, built via training.mjson_token_cache)')
     parser.add_argument('--build_mjson_cache', action='store_true',
                         help='Build MJSON tensor shards before training, or build and exit when data_format is not mjson_cache')
     parser.add_argument('--cache_shard_size', type=int, default=65536,
@@ -1599,6 +1607,47 @@ def main():
         test_set = OracleTrajectoryIterableDataset(
             test_files, shuffle_files=False, seed=args.split_seed)
 
+    elif args.mjson_token_cache:
+        if not is_transformer:
+            raise ValueError(
+                '--mjson_token_cache requires --model_arch transformer. '
+                'Token caches store token sequences, not state vectors.')
+        token_cache_manifest = load_token_cache_manifest(args.mjson_token_cache)
+        streaming_mode = True
+        prebatched_mode = True
+        train_set = TokenShardBatchDataset(
+            token_shard_paths_for_split(
+                args.mjson_token_cache, token_cache_manifest, 'train'),
+            batch_size=args.batch_size,
+            shuffle_shards=True,
+            shuffle_samples=True,
+            drop_last=True,
+            seed=args.split_seed,
+        )
+        val_set = TokenShardBatchDataset(
+            token_shard_paths_for_split(
+                args.mjson_token_cache, token_cache_manifest, 'val'),
+            batch_size=args.batch_size,
+            shuffle_shards=False,
+            shuffle_samples=False,
+            drop_last=False,
+            seed=args.split_seed,
+        )
+        test_set = TokenShardBatchDataset(
+            token_shard_paths_for_split(
+                args.mjson_token_cache, token_cache_manifest, 'test'),
+            batch_size=args.batch_size,
+            shuffle_shards=False,
+            shuffle_samples=False,
+            drop_last=False,
+            seed=args.split_seed,
+        )
+        print(
+            f"Token cache split: "
+            f"train={token_cache_manifest['splits']['train']['num_samples']}, "
+            f"val={token_cache_manifest['splits']['val']['num_samples']}, "
+            f"test={token_cache_manifest['splits']['test']['num_samples']} samples"
+        )
     elif args.data_format == 'mjson_cache':
         if is_transformer:
             raise ValueError(

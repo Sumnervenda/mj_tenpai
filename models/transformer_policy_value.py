@@ -59,7 +59,7 @@ class TransformerPolicyValueNet(nn.Module):
     def __init__(self,
                  vocab_size: int = TokenVocab.VOCAB_SIZE,
                  num_token_types: int = TokenType.NUM_TYPES,
-                 num_behavior_types: int = 64,
+                 num_behavior_types: int = TokenVocab.MAX_BEHAVIOR_ID,
                  d_model: int = 256,
                  n_concept: int = 10,
                  n_private_concept: int = 4,

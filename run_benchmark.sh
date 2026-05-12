@@ -13,6 +13,15 @@ set -euo pipefail
 
 CKPT="${1:-}"
 BATCHES="${BENCHMARK_BATCHES:-1000}"
+SIZES="${BENCHMARK_SIZES:-128,256,512}"
+DEVICE="${BENCHMARK_DEVICE:-cuda}"
+NO_COMPILE="${BENCHMARK_NO_COMPILE:-0}"
+OUTPUT="${BENCHMARK_OUTPUT:-}"
+
+if [ -d ".venv" ] && [ -z "${VIRTUAL_ENV:-}" ]; then
+    # shellcheck disable=SC1091
+    source .venv/bin/activate
+fi
 
 echo "=========================================="
 echo "  GPU Benchmark"
@@ -23,17 +32,27 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>
 echo ""
 
 # 构建参数
-BENCH_ARGS="--batches $BATCHES --sizes 128,256,512"
-if [ -n "$CKPT" ] && [ -f "$CKPT" ]; then
+BENCH_ARGS=(--batches "$BATCHES" --sizes "$SIZES" --device "$DEVICE")
+if [ -n "$CKPT" ]; then
+    if [ ! -f "$CKPT" ]; then
+        echo "Error: checkpoint not found: $CKPT" >&2
+        exit 1
+    fi
     echo "Checkpoint: $CKPT"
-    BENCH_ARGS="$BENCH_ARGS --checkpoint $CKPT"
+    BENCH_ARGS+=(--checkpoint "$CKPT")
 else
-    echo "No checkpoint found, using randomly initialized model"
+    echo "No checkpoint provided, using randomly initialized model"
+fi
+if [ "$NO_COMPILE" = "1" ]; then
+    BENCH_ARGS+=(--no_compile)
+fi
+if [ -n "$OUTPUT" ]; then
+    BENCH_ARGS+=(--output "$OUTPUT")
 fi
 echo ""
 
 # 运行基准测试
-python -m training.benchmark $BENCH_ARGS
+python -m training.benchmark "${BENCH_ARGS[@]}"
 
 echo ""
 echo "=========================================="

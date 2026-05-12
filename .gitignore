@@ -30,6 +30,10 @@ dist/
 .tmp_pytest_review/
 wandb/
 *.log
+benchmark_results.json
+
+# Token cache (built locally)
+dataset/token_cache*/
 
 # Scratch / review files
 review.md

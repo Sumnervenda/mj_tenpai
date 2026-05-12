@@ -546,11 +546,12 @@ class TestAdvancedParserValidation:
             os.unlink(tmp)
 
     def test_out_of_range_behavior_id_raises(self):
-        """Behavior ID >= 64 must raise ValueError."""
+        """Behavior ID >= MAX_BEHAVIOR_ID must raise ValueError."""
         from data.record_parser import OracleTrajectoryJSONLParser
+        from models.tokenizer import TokenVocab
         parser = OracleTrajectoryJSONLParser()
         step = _make_oracle_step(has_private=True)
-        step['public_behavior_ids'][0] = 100
+        step['public_behavior_ids'][0] = TokenVocab.MAX_BEHAVIOR_ID + 10
         with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False,
                                           encoding='utf-8') as f:
             f.write(json.dumps(step) + '\n')

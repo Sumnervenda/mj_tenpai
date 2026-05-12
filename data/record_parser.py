@@ -183,6 +183,8 @@ class OracleTrajectoryJSONLParser:
         """
         import json
         from pathlib import Path
+        from models.tokenizer import TokenVocab as _TV
+        _MAX_BEHAVIOR = _TV.MAX_BEHAVIOR_ID
         with Path(filepath).open('r', encoding='utf-8') as f:
             for line_no, line in enumerate(f, 1):
                 line = line.strip()
@@ -269,10 +271,10 @@ class OracleTrajectoryJSONLParser:
                             f"{filepath}:{line_no}: public_token_types[{i}] "
                             f"={tt} < 0")
                 for i, bid in enumerate(pub_bids):
-                    if bid < 0 or bid >= 64:
+                    if bid < 0 or bid >= _MAX_BEHAVIOR:
                         raise ValueError(
                             f"{filepath}:{line_no}: public_behavior_ids[{i}] "
-                            f"={bid} out of range [0, 64)")
+                            f"={bid} out of range [0, {_MAX_BEHAVIOR})")
                 for i, tid in enumerate(priv_ids):
                     if tid < 0:
                         raise ValueError(
@@ -284,10 +286,10 @@ class OracleTrajectoryJSONLParser:
                             f"{filepath}:{line_no}: private_token_types[{i}] "
                             f"={tt} < 0")
                 for i, bid in enumerate(priv_bids):
-                    if bid < 0 or bid >= 64:
+                    if bid < 0 or bid >= _MAX_BEHAVIOR:
                         raise ValueError(
                             f"{filepath}:{line_no}: private_behavior_ids[{i}] "
-                            f"={bid} out of range [0, 64)")
+                            f"={bid} out of range [0, {_MAX_BEHAVIOR})")
 
                 reward = record.get('reward', 0.0)
                 # reward 必须有限（不允许 NaN / ±Inf）

@@ -64,7 +64,8 @@ mj_tenpai/
 │   ├── iterative_rl.py              #   迭代式自博弈（对抗历史快照）
 │   ├── heuristic_agent.py           #   启发式基线智能体
 │   ├── reward_shaper.py             #   奖励塑形（Turtle/MadDog/RiichiFund 风格）
-│   └── mjson_cache.py               #   MJSON → TensorShard 缓存构建
+│   ├── mjson_cache.py               #   MJSON → TensorShard 缓存构建
+│   └── mjson_token_cache.py         #   MJSON → Token 序列缓存构建（Transformer 专用）
 │
 ├── scripts/                         # 工具脚本
 │   └── save_manifest.py             #   保存 train/val/test 数据 split manifest
@@ -223,6 +224,8 @@ python -m training.iterative_rl \
 
 ## 云服务器训练
 
+更完整的服务器操作手册见 [`SERVER_TRAINING.md`](SERVER_TRAINING.md)。
+
 ### 快速上手（推荐流程）
 
 ```bash
@@ -235,10 +238,18 @@ chmod +x setup_server.sh && ./setup_server.sh
 scp dataset_2021_2026.tar user@server:~/mj_tenpai/
 # 服务器解压: tar -xf dataset_2021_2026.tar
 
-# 3. 先跑短基准（确认 GPU 性能，判断是否换卡）
+# 3. 构建 Transformer token cache（训练阶段不再解析 mjson）
+python -m training.mjson_token_cache build \
+    --source dataset/datasets_years \
+    --cache dataset/token_cache_2021-2026 \
+    --years 2021,2022,2023,2024,2025,2026 \
+    --num_workers 16 \
+    --shard_size 10000
+
+# 4. 先跑短基准（确认 GPU 性能，判断是否换卡）
 chmod +x run_benchmark.sh && ./run_benchmark.sh
 
-# 4. 启动训练（step-level checkpoint 每 30 分钟自动保存）
+# 5. 启动训练（默认使用 token cache；step-level checkpoint 每 30 分钟自动保存）
 chmod +x run_train.sh && ./run_train.sh
 ```
 
@@ -261,6 +272,34 @@ python -m training.benchmark --checkpoint sl_best.pt --sizes 128,256,512 --batch
 | < 20 | 检查配置 | >20h |
 
 若 batch_size=512 不比 256 快，优先用 256（省显存）。若 compile 不提速或 OOM，不用 `--compile`。
+
+### Token 缓存（消除 CPU 瓶颈）
+
+训练时每 epoch 重复解析 mjson → 回放对局 → tokenization 420M 样本，CPU 成为瓶颈。**Token 缓存**将 tokenization 结果预先计算并压缩存储，训练时直接加载，数据读取速度提升 10-50x。
+
+```bash
+# 1. 构建 token 缓存（一次性，推荐 --num_workers 16-32 充分利用 CPU）
+python -m training.mjson_token_cache build \
+    --source dataset/datasets_years \
+    --cache dataset/token_cache_2021-2026 \
+    --years 2021,2022,2023,2024,2025,2026 \
+    --num_workers 16
+
+# 2. 查看缓存信息
+python -m training.mjson_token_cache info --cache dataset/token_cache_2021-2026
+
+# 3. 使用缓存训练（跳过流式解析）
+python -m training.sl_pretrain \
+    --mjson_token_cache dataset/token_cache_2021-2026 \
+    --model_arch transformer \
+    --epochs 10 --batch_size 256 --lr 3e-4 \
+    --wandb --checkpoint_dir checkpoints/transformer_2021-2026 \
+    --device cuda
+```
+
+**存储估算**：~13 GB / 420M 样本（int16 + zlib 压缩，约为原始 mjson 的 10%）。通过长度分桶（5 个桶: 1-80, 81-120, 121-160, 161-200, 201-256）最小化 padding 浪费。
+
+**注意**：Token 缓存仅支持 `--model_arch transformer`。ResNet 使用 `--mjson_cache_dir` 和 `--data_format mjson_cache`。
 
 ### 数据 Split Manifest（确保可复现）
 
@@ -395,6 +434,9 @@ wandb sync wandb/offline-run-*
 | `--mjson_years` | - | 使用的年份，如 `"2021,2022,2023"` |
 | `--stream_mjson` | - | 流式加载（避免 OOM） |
 | `--manifest` | - | 数据 split manifest JSON 路径 |
+| `--mjson_token_cache` | - | Token 缓存目录（Transformer only，替代流式解析） |
+| `--mjson_cache_dir` | - | ResNet tensor 缓存目录（`data_format=mjson_cache` 时使用） |
+| `--build_mjson_cache` | - | 构建 ResNet tensor 缓存 |
 | `--epochs` | `10` | 训练 epoch 数 |
 | `--batch_size` | `256` | batch size（256 适配 16GB 显存） |
 | `--lr` | `3e-4` | 学习率 |
@@ -418,11 +460,12 @@ wandb sync wandb/offline-run-*
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--checkpoint` | (必填) | 模型 checkpoint 路径 |
+| `--checkpoint` | - | 模型 checkpoint 路径；不传则使用随机初始化模型 |
 | `--batches` | `1000` | 每个配置跑的 batch 数 |
 | `--sizes` | `128,256,512` | 测试的 batch sizes |
 | `--device` | `cuda` | 设备 |
 | `--no_compile` | - | 跳过 `torch.compile` 测试 |
+| `--output` | 自动 | JSON 结果输出路径；`none` 表示不写文件 |
 
 ---
 

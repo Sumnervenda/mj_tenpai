@@ -50,13 +50,19 @@ class TestTokenizerConstruction:
     """Test basic tokenizer construction and vocabulary."""
 
     def test_vocab_constants(self):
-        assert TokenVocab.VOCAB_SIZE == 192
+        assert TokenVocab.VOCAB_SIZE == 128
         assert TokenVocab.PAD == 0
         assert TokenVocab.TILE_MIN == 1
         assert TokenVocab.TILE_MAX == 34
         assert TokenVocab.RED_5M == 35
         assert TokenVocab.ACTION_TSUMOGIRI == 42
         assert TokenVocab.ROUND_EAST == 55
+        assert TokenVocab.REMAINING == 63
+        assert TokenVocab.DIFF_TO_1ST == 64
+        assert TokenVocab.DIFF_TO_2ND == 65
+        assert TokenVocab.HONBA == 68
+        assert TokenVocab.RIICHI_STICK == 69
+        assert TokenVocab.MAX_BEHAVIOR_ID == 128
 
     def test_token_type_constants(self):
         assert TokenType.HAND == 0
@@ -182,8 +188,8 @@ class TestTokenizerGlobal:
 
         global_tokens = [t for t in seq.tokens
                          if t.token_type == TokenType.GLOBAL]
-        # Round wind + seat wind + remaining + honba + riichi stick + 3 diffs = 8
-        assert len(global_tokens) == 8
+        # Round wind + seat wind + remaining + honba + riichi stick + 4 diffs = 9
+        assert len(global_tokens) == 9
 
 
 class TestTokenizerSequence:
@@ -194,8 +200,8 @@ class TestTokenizerSequence:
         tokenizer = MahjongTokenizer()
         seq = tokenizer.tokenize_game_snapshot(tracker, player_idx=0)
 
-        # hand(13) + dora(1) + discard(6) + meld(6) + riichi(1) + global(8) = 35
-        assert len(seq) == 35
+        # hand(13) + dora(1) + discard(6) + meld(6) + riichi(1) + global(9) = 36
+        assert len(seq) == 36
 
     def test_max_sequence_length(self):
         """Test that sequence is capped at max_len."""

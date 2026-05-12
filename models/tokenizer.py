@@ -70,12 +70,16 @@ class TokenVocab:
     SELF_SOUTH = 60
     SELF_WEST = 61
     SELF_NORTH = 62
-    REMAINING_BASE = 63   # 剩余牌数标记从 63 开始（63 + remaining）
-    HONBA = 93            # 本场数
-    RIICHI_STICK = 94     # 立直棒标记
-    DIFF_BASE = 95        # 分差标记从 95 开始（95 + 分差归一化区间）
+    REMAINING = 63        # 剩余牌数，数值在 behavior_id
+    DIFF_TO_1ST = 64      # 自己与第一位分差，数值在 behavior_id
+    DIFF_TO_2ND = 65      # 自己与第二位分差
+    DIFF_TO_3RD = 66      # 自己与第三位分差
+    DIFF_TO_4TH = 67      # 自己与第四位分差
+    HONBA = 68            # 本场数，数值在 behavior_id
+    RIICHI_STICK = 69     # 立直棒数量，数值在 behavior_id
 
-    VOCAB_SIZE = 192      # 总词表大小（覆盖 DIFF_BASE+60=155，留余量）
+    VOCAB_SIZE = 128      # 总词表大小
+    MAX_BEHAVIOR_ID = 128 # behavior embedding 表大小（含 remaining 0-70 + diff ±31+32）
 
 
 class TokenType:
@@ -282,10 +286,10 @@ class MahjongTokenizer:
         elif seat_wind == 30:
             seq.add(TokenVocab.SELF_NORTH, TokenType.GLOBAL)
 
-        # 剩余牌数
+        # 剩余牌数 — 语义 token + behavior_id 嵌具体数值
         remaining = state.remaining_tiles
-        remaining_id = TokenVocab.REMAINING_BASE + min(remaining, 70)
-        seq.add(remaining_id, TokenType.GLOBAL)
+        seq.add(TokenVocab.REMAINING, TokenType.GLOBAL,
+                min(remaining, TokenVocab.MAX_BEHAVIOR_ID - 1))
 
         # 本场数
         seq.add(TokenVocab.HONBA, TokenType.GLOBAL, state.honba)
@@ -293,12 +297,18 @@ class MahjongTokenizer:
         # 立直棒数量
         seq.add(TokenVocab.RIICHI_STICK, TokenType.GLOBAL, state.riichi_sticks)
 
-        # 分差（对其他三家）
+        # 分差（按排名语义分为 4 个 token）
+        all_scores = [(state.scores[player_idx], player_idx)]
         for opp in opponents:
-            diff = state.scores[opp] - state.scores[player_idx]
-            diff_clamped = max(-30, min(30, diff // 1000))
-            diff_id = TokenVocab.DIFF_BASE + (diff_clamped + 30)
-            seq.add(diff_id, TokenType.GLOBAL)
+            all_scores.append((state.scores[opp], opp))
+        all_scores.sort(key=lambda x: x[0], reverse=True)
+
+        diff_tokens = [TokenVocab.DIFF_TO_1ST, TokenVocab.DIFF_TO_2ND,
+                       TokenVocab.DIFF_TO_3RD, TokenVocab.DIFF_TO_4TH]
+        for rank_idx, (score, _pid) in enumerate(all_scores):
+            diff = state.scores[player_idx] - score
+            diff_clamped = max(-31, min(31, diff // 1000))
+            seq.add(diff_tokens[rank_idx], TokenType.GLOBAL, diff_clamped + 32)
 
         # 7. 截断到最大长度
         if len(seq) > self.max_len:
@@ -542,10 +552,10 @@ class MahjongTokenizer:
         elif seat_wind == 30:
             seq.add(TokenVocab.SELF_NORTH, TokenType.GLOBAL)
 
-        # 剩余牌数
+        # 剩余牌数 — 语义 token + behavior_id 嵌具体数值
         remaining = tracker.remaining_tiles
-        remaining_id = TokenVocab.REMAINING_BASE + min(remaining, 70)
-        seq.add(remaining_id, TokenType.GLOBAL)
+        seq.add(TokenVocab.REMAINING, TokenType.GLOBAL,
+                min(remaining, TokenVocab.MAX_BEHAVIOR_ID - 1))
 
         # 本场数
         seq.add(TokenVocab.HONBA, TokenType.GLOBAL, tracker.honba)
@@ -553,18 +563,179 @@ class MahjongTokenizer:
         # 立直棒数量
         seq.add(TokenVocab.RIICHI_STICK, TokenType.GLOBAL, tracker.kyotaku)
 
-        # 分差（对其他三家）
+        # 分差（按排名语义分为 4 个 token）
         opponents = [i for i in range(4) if i != player_idx]
+        all_scores = [(tracker.scores[player_idx], player_idx)]
         for opp in opponents:
-            diff = tracker.scores[opp] - tracker.scores[player_idx]
-            # 分差归一化到 -30~30（+/-30000点），映射到 DIFF_BASE+0~DIFF_BASE+60
-            diff_clamped = max(-30, min(30, diff // 1000))
-            diff_id = TokenVocab.DIFF_BASE + (diff_clamped + 30)
-            seq.add(diff_id, TokenType.GLOBAL)
+            all_scores.append((tracker.scores[opp], opp))
+        all_scores.sort(key=lambda x: x[0], reverse=True)  # 分数降序 = 排名
+
+        diff_tokens = [TokenVocab.DIFF_TO_1ST, TokenVocab.DIFF_TO_2ND,
+                       TokenVocab.DIFF_TO_3RD, TokenVocab.DIFF_TO_4TH]
+        for rank_idx, (score, _pid) in enumerate(all_scores):
+            diff = tracker.scores[player_idx] - score  # self - rank_N
+            diff_clamped = max(-31, min(31, diff // 1000))
+            seq.add(diff_tokens[rank_idx], TokenType.GLOBAL, diff_clamped + 32)
 
     def _seat_wind(self, tracker: MJSONGameTracker, player_idx: int) -> int:
         """计算玩家自风。"""
         winds = [27, 28, 29, 30]
         offset = (player_idx - tracker.oya) % 4
         return winds[offset]
+
+
+def tokenize_game_snapshot_fast(tracker: 'MJSONGameTracker',
+                                player_idx: int,
+                                max_len: int = 256
+                                ) -> Tuple['np.ndarray', 'np.ndarray',
+                                           'np.ndarray']:
+    """Fast-path tokenizer: returns numpy arrays directly, no Python objects.
+
+    Returns (token_ids, token_types, behavior_ids) as int16/int8/int16 arrays.
+    This avoids Token/TokenSequence allocation overhead and is ~3-5x faster
+    than tokenize_game_snapshot() for cache building.
+    """
+    import numpy as np
+
+    # Pre-allocate (max_len is enough for any real sequence)
+    ids = np.zeros(max_len, dtype=np.int16)
+    types = np.zeros(max_len, dtype=np.int8)
+    bids = np.zeros(max_len, dtype=np.int16)
+    idx = 0
+
+    hand = tracker.hands[player_idx]
+    aka = tracker.aka_counts[player_idx]
+
+    # 1. Hand tokens
+    tiles = []
+    for t in range(34):
+        count = hand[t]
+        if count > 0:
+            aka_count = aka.get(t, 0)
+            for _ in range(aka_count):
+                tiles.append((t, True))
+            for _ in range(count - aka_count):
+                tiles.append((t, False))
+
+    for tile_type, red in tiles:
+        if red:
+            if tile_type == 4:
+                tid = 35   # RED_5M
+            elif tile_type == 13:
+                tid = 36   # RED_5P
+            elif tile_type == 22:
+                tid = 37   # RED_5S
+            else:
+                tid = tile_type + 1
+        else:
+            tid = tile_type + 1
+        ids[idx] = tid
+        types[idx] = 0  # HAND
+        idx += 1
+
+    # 2. Dora indicator tokens
+    for dora_type in tracker.dora_indicators:
+        if 0 <= dora_type < 34:
+            ids[idx] = dora_type + 1
+            types[idx] = 1  # DORA
+            idx += 1
+
+    # 3. Discard sequence (self first, then opponents in order)
+    opponents = [i for i in range(4) if i != player_idx]
+    ordered = [player_idx] + opponents
+    for p in ordered:
+        for tile_type in tracker.discards[p]:
+            if 0 <= tile_type < 34:
+                ids[idx] = tile_type + 1
+                types[idx] = 2  # DISCARD
+                bids[idx] = p * 4  # TEDASHI offset
+                idx += 1
+
+    # 4. Meld sequence
+    meld_type_map = {
+        'chi': 50, 'pon': 51, 'daiminkan': 52, 'ankan': 54, 'kakan': 53,
+    }
+    for p in ordered:
+        for meld_type_str, tiles_list, _called_from in tracker.melds[p]:
+            mt = meld_type_map.get(meld_type_str, 50)
+            first_tile = tiles_list[0] if tiles_list else 0
+            behavior_id = p * 8 + (mt - 50)
+            ids[idx] = first_tile + 1 if 0 <= first_tile < 34 else 0
+            types[idx] = 3  # MELD
+            bids[idx] = behavior_id
+            idx += 1
+            for t in tiles_list[1:]:
+                if 0 <= t < 34:
+                    ids[idx] = t + 1
+                    types[idx] = 3
+                    bids[idx] = behavior_id
+                    idx += 1
+
+    # 5. Riichi events
+    for p in range(4):
+        if tracker.is_riichi[p]:
+            ids[idx] = 48  # ACTION_RIICHI
+            types[idx] = 4  # RIICHI
+            bids[idx] = p
+            idx += 1
+
+    # 6. Global tokens
+    # Round wind
+    if tracker.bakaze == 27:
+        ids[idx] = 55  # ROUND_EAST
+    elif tracker.bakaze == 28:
+        ids[idx] = 56  # ROUND_SOUTH
+    elif tracker.bakaze == 29:
+        ids[idx] = 57  # ROUND_WEST
+    elif tracker.bakaze == 30:
+        ids[idx] = 58  # ROUND_NORTH
+    types[idx] = 5  # GLOBAL
+    idx += 1
+
+    # Seat wind
+    winds = [27, 28, 29, 30]
+    seat_wind = winds[(player_idx - tracker.oya) % 4]
+    seat_map = {27: 59, 28: 60, 29: 61, 30: 62}
+    ids[idx] = seat_map.get(seat_wind, 59)
+    types[idx] = 5
+    idx += 1
+
+    # Remaining tiles — semantic token + behavior_id carries value
+    remaining = tracker.remaining_tiles
+    ids[idx] = 63  # REMAINING
+    types[idx] = 5
+    bids[idx] = min(remaining, 127)
+    idx += 1
+
+    # Honba
+    ids[idx] = 68  # HONBA
+    types[idx] = 5
+    bids[idx] = tracker.honba
+    idx += 1
+
+    # Riichi sticks
+    ids[idx] = 69  # RIICHI_STICK
+    types[idx] = 5
+    bids[idx] = tracker.kyotaku
+    idx += 1
+
+    # Score diffs — 4 semantic tokens by rank position
+    all_scores = [(tracker.scores[player_idx], player_idx)]
+    for opp in opponents:
+        all_scores.append((tracker.scores[opp], opp))
+    all_scores.sort(key=lambda x: x[0], reverse=True)
+    diff_token_ids = [64, 65, 66, 67]  # DIFF_TO_1ST .. DIFF_TO_4TH
+    for rank_idx, (score, _pid) in enumerate(all_scores):
+        diff = tracker.scores[player_idx] - score
+        diff_clamped = max(-31, min(31, diff // 1000))
+        ids[idx] = diff_token_ids[rank_idx]
+        types[idx] = 5
+        bids[idx] = diff_clamped + 32
+        idx += 1
+
+    # Truncate
+    if idx > max_len:
+        idx = max_len
+
+    return ids[:idx].copy(), types[:idx].copy(), bids[:idx].copy()
 # 中文注释：将麻将局面从 MJSON 解析器状态转换为 Transformer 可消费的 Token 序列。

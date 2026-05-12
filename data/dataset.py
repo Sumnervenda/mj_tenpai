@@ -331,6 +331,108 @@ class TensorShardBatchDataset(IterableDataset):
         if self.drop_last:
             return self.total_samples // self.batch_size
         return math.ceil(self.total_samples / self.batch_size)
+
+
+class TokenShardBatchDataset(IterableDataset):
+    """Stream pre-tokenized batches from mjson_token_cache shards.
+
+    Each shard contains pre-padded token sequences at a fixed max_len.
+    The dataset yields pre-built batch dicts directly — use batch_size=None
+    in DataLoader (prebatched mode).
+
+    Args:
+        shard_paths: List of .npz shard file paths
+        batch_size: Number of samples per batch
+        shuffle_shards: Shuffle shard order each epoch
+        shuffle_samples: Shuffle sample order within each shard
+        drop_last: Drop incomplete final batch
+        seed: Random seed
+    """
+
+    def __init__(self,
+                 shard_paths: Sequence[str],
+                 batch_size: int,
+                 shuffle_shards: bool = False,
+                 shuffle_samples: bool = False,
+                 drop_last: bool = False,
+                 seed: int = 42):
+        super().__init__()
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        self.shard_paths = [str(p) for p in shard_paths]
+        self.batch_size = batch_size
+        self.shuffle_shards = shuffle_shards
+        self.shuffle_samples = shuffle_samples
+        self.drop_last = drop_last
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __iter__(self):
+        paths = list(self.shard_paths)
+        rng = np.random.default_rng(self.seed + self.epoch)
+        if self.shuffle_shards:
+            rng.shuffle(paths)
+
+        worker = get_worker_info()
+        if worker is not None:
+            paths = paths[worker.id::worker.num_workers]
+
+        for path in paths:
+            with np.load(path, allow_pickle=False) as shard:
+                token_ids = shard["token_ids"]
+                token_types = shard["token_types"]
+                behavior_ids = shard["behavior_ids"]
+                attention_mask = shard["attention_mask"]
+                action_mask = shard["action_mask"]
+                labels = shard["labels"]
+                n = int(labels.shape[0])
+                if n == 0:
+                    continue
+
+                order = None
+                if self.shuffle_samples:
+                    order = rng.permutation(n)
+
+                for start in range(0, n, self.batch_size):
+                    end = min(start + self.batch_size, n)
+                    if self.drop_last and end - start < self.batch_size:
+                        continue
+                    if order is None:
+                        index = slice(start, end)
+                    else:
+                        index = order[start:end]
+
+                    batch = {
+                        'token_ids': torch.from_numpy(
+                            token_ids[index].astype(np.int64, copy=False)),
+                        'token_types': torch.from_numpy(
+                            token_types[index].astype(np.int64, copy=False)),
+                        'behavior_ids': torch.from_numpy(
+                            behavior_ids[index].astype(np.int64, copy=False)),
+                        'attention_mask': torch.from_numpy(
+                            attention_mask[index].copy()),
+                        'action_mask': torch.from_numpy(
+                            action_mask[index].astype(np.float32, copy=False)),
+                        'labels': torch.from_numpy(
+                            labels[index].astype(np.int64, copy=False)),
+                    }
+                    yield batch
+
+    def __len__(self) -> int:
+        # Approximate
+        total = 0
+        for path in self.shard_paths:
+            try:
+                with np.load(path, allow_pickle=False) as shard:
+                    total += int(shard["labels"].shape[0])
+            except Exception:
+                continue
+        if self.drop_last:
+            return total // self.batch_size
+        return math.ceil(total / self.batch_size)
 # 中文注释：PyTorch 数据集封装，连接牌谱解析结果和监督学习 DataLoader。
 
 

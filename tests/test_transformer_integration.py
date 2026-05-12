@@ -79,11 +79,10 @@ class TestRealTokenizerToTransformer:
         # Also check known high-range values
         remaining_token = next(
             t for t in seq.tokens
-            if t.token_id >= TokenVocab.REMAINING_BASE
+            if t.token_id == TokenVocab.REMAINING
         )
-        remaining_val = remaining_token.token_id - TokenVocab.REMAINING_BASE
-        assert remaining_val == 70, \
-            f"Expected remaining offset 70, got {remaining_val}"
+        assert remaining_token.behavior_id == 70, \
+            f"Expected remaining behavior_id=70, got {remaining_token.behavior_id}"
 
     def test_max_behavior_id_within_embedding(self):
         """All behavior_ids must fit within num_behavior_types."""
@@ -95,7 +94,7 @@ class TestRealTokenizerToTransformer:
             (t.behavior_id for t in seq.tokens if t.behavior_id > 0),
             default=0,
         )
-        num_behavior_types = 64
+        num_behavior_types = TokenVocab.MAX_BEHAVIOR_ID
         assert max_bid < num_behavior_types, \
             f"max_behavior_id={max_bid} >= num_behavior_types={num_behavior_types}"
 

@@ -17,27 +17,45 @@ import sys
 import time
 
 import torch
-import torch.nn as nn
-from torch.amp import GradScaler, autocast
+from torch.amp import autocast
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from models.model_io import load_checkpoint_metadata, infer_transformer_config_from_state_dict
+from models.tokenizer import TokenType, TokenVocab
 from models.transformer_policy_value import TransformerPolicyValueNet
 
 
 def run_benchmark(model, device, batch_size, num_batches, use_amp=True,
-                  use_compile=False, max_len=256, d_model=256):
+                  use_compile=False, max_len=256, n_concept=10):
     """运行短基准测试，返回性能指标。"""
     model.eval()
-    scaler = GradScaler('cuda', enabled=use_amp and device.startswith('cuda'))
+    amp_enabled = bool(use_amp and device.startswith('cuda'))
 
     # 生成随机输入（减掉 concept tokens，避免超过 backbone max_len）
-    seq_len = max_len - 10  # 10 public concept tokens
-    token_ids = torch.randint(0, 192, (batch_size, seq_len), device=device)
-    token_types = torch.randint(0, 6, (batch_size, seq_len), device=device)
-    behavior_ids = torch.randint(0, 64, (batch_size, seq_len), device=device)
-    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
+    seq_len = max_len - n_concept
+    if seq_len <= 0:
+        raise ValueError(
+            f"max_len={max_len} must be greater than n_concept={n_concept}")
+
+    # PAD=0 只用于 padding；真实 token 从 1 开始。
+    token_ids = torch.randint(
+        TokenVocab.TILE_MIN,
+        TokenVocab.VOCAB_SIZE,
+        (batch_size, seq_len),
+        device=device,
+    )
+    token_types = torch.randint(
+        0, TokenType.NUM_TYPES, (batch_size, seq_len), device=device)
+    behavior_ids = torch.randint(
+        0,
+        TokenVocab.MAX_BEHAVIOR_ID,
+        (batch_size, seq_len),
+        device=device,
+    )
+    # True = padding；benchmark 输入全是真实 token，所以全 False。
+    attention_mask = torch.zeros(
+        batch_size, seq_len, dtype=torch.bool, device=device)
     action_mask = torch.ones(batch_size, 77, dtype=torch.float32, device=device)
 
     if use_compile and hasattr(torch, 'compile'):
@@ -46,7 +64,7 @@ def run_benchmark(model, device, batch_size, num_batches, use_amp=True,
     # Warmup
     with torch.no_grad():
         for _ in range(3):
-            with autocast('cuda', enabled=use_amp):
+            with autocast('cuda', enabled=amp_enabled):
                 model(token_ids, token_types, behavior_ids,
                       attention_mask, action_mask)
     if device.startswith('cuda'):
@@ -57,7 +75,7 @@ def run_benchmark(model, device, batch_size, num_batches, use_amp=True,
     t_start = time.time()
     with torch.no_grad():
         for i in range(num_batches):
-            with autocast('cuda', enabled=use_amp):
+            with autocast('cuda', enabled=amp_enabled):
                 outputs = model(token_ids, token_types, behavior_ids,
                                 attention_mask, action_mask)
     if device.startswith('cuda'):
@@ -84,7 +102,7 @@ def run_benchmark(model, device, batch_size, num_batches, use_amp=True,
         'samples_s': round(samples_s, 0),
         'max_vram_gb': round(max_mem_gb, 2),
         'est_epoch_hours': round(est_epoch_hours, 1),
-        'use_amp': use_amp,
+        'use_amp': amp_enabled,
         'use_compile': use_compile,
         'seq_len': seq_len,
     }
@@ -103,22 +121,43 @@ def main():
                         help='Device (default: cuda)')
     parser.add_argument('--no_compile', action='store_true',
                         help='Skip torch.compile test')
+    parser.add_argument('--output', type=str, default=None,
+                        help='JSON output path. Defaults to benchmark_results.json '
+                             'beside the checkpoint, or ./benchmark_results.json '
+                             'when no checkpoint is provided. Use "none" to skip.')
     parser.add_argument('--d_model', type=int, default=256)
     parser.add_argument('--n_layers', type=int, default=6)
-    parser.add_argument('--n_heads', type=int, default=8)
+    parser.add_argument('--n_heads', type=int, default=None,
+                        help='Attention heads. Required only when loading an old '
+                             'checkpoint whose metadata lacks n_heads.')
     parser.add_argument('--n_concept', type=int, default=10)
     parser.add_argument('--max_len', type=int, default=256)
     args = parser.parse_args()
 
+    if args.device.startswith('cuda') and not torch.cuda.is_available():
+        print("CUDA was requested but is not available; falling back to CPU")
+        args.device = 'cpu'
+
     # 加载或使用默认模型配置
     if args.checkpoint:
+        if not os.path.exists(args.checkpoint):
+            raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
         meta = load_checkpoint_metadata(args.checkpoint)
         ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
         sd = ckpt['model_state_dict']
         cfg = infer_transformer_config_from_state_dict(sd, meta)
         d_model = cfg.get('d_model', 256)
         n_layers = cfg.get('n_layers', 6)
-        n_heads = cfg.get('n_heads', 8)
+        n_heads = cfg.get('n_heads')
+        if n_heads is None:
+            if args.n_heads is None:
+                raise ValueError(
+                    "Checkpoint metadata is missing n_heads. Re-save the "
+                    "checkpoint with n_heads in metadata, or pass --n_heads "
+                    "explicitly for this benchmark run.")
+            n_heads = args.n_heads
+            print(f"WARNING: checkpoint metadata lacks n_heads; using "
+                  f"--n_heads={n_heads}")
         n_concept = cfg.get('n_concept', 10)
         max_len = cfg.get('max_len', 256)
         print(f"Loaded checkpoint: {args.checkpoint}")
@@ -126,7 +165,7 @@ def main():
         sd = None
         d_model = args.d_model
         n_layers = args.n_layers
-        n_heads = args.n_heads
+        n_heads = args.n_heads or 8
         n_concept = args.n_concept
         max_len = args.max_len
         print("No checkpoint provided, using randomly initialized model")
@@ -160,7 +199,8 @@ def main():
 
         try:
             r = run_benchmark(model, args.device, bs, args.batches,
-                              use_amp=True, use_compile=False, max_len=max_len)
+                              use_amp=True, use_compile=False,
+                              max_len=max_len, n_concept=n_concept)
             results.append(r)
             print(f"  {r['batch_s']:.1f} batch/s | {r['samples_s']:.0f} samples/s | "
                   f"VRAM {r['max_vram_gb']:.1f} GB | "
@@ -196,7 +236,8 @@ def main():
                 model2 = model2.to(args.device)
                 try:
                     r2 = run_benchmark(model2, args.device, bs, min(args.batches, 200),
-                                       use_amp=True, use_compile=True, max_len=max_len)
+                                       use_amp=True, use_compile=True,
+                                       max_len=max_len, n_concept=n_concept)
                     r2['config'] = f'bs{bs}_compile'
                     results.append(r2)
                     print(f"  +compile: {r2['batch_s']:.1f} batch/s | "
@@ -236,11 +277,20 @@ def main():
     print(f"      Estimated samples_per_epoch = 420M (900K files x 670 samples)")
 
     # 保存结果
-    _base_dir = os.path.dirname(args.checkpoint) if args.checkpoint else '.'
-    out_path = os.path.join(_base_dir, 'benchmark_results.json')
-    with open(out_path, 'w') as f:
-        json.dump(results, f, indent=2)
-    print(f"\nResults saved to {out_path}")
+    if args.output is not None and args.output.lower() in {'none', 'skip', '-'}:
+        print("\nResults not written (--output none)")
+    else:
+        if args.output:
+            out_path = args.output
+        else:
+            _base_dir = os.path.dirname(args.checkpoint) if args.checkpoint else '.'
+            out_path = os.path.join(_base_dir, 'benchmark_results.json')
+        out_dir = os.path.dirname(out_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(out_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"\nResults saved to {out_path}")
 
 
 if __name__ == '__main__':

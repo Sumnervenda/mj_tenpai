@@ -53,7 +53,9 @@ def infer_transformer_config_from_state_dict(
         metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """从 state_dict 推断 Transformer 配置，用于 metadata 不完整的 checkpoint。
 
-    推断顺序：metadata 优先；缺失时从权重形状推断；仍无法推断时使用 None。
+    推断顺序：state_dict 形状优先；metadata 只补充形状无法可靠推断的字段。
+    这样可以避免旧 checkpoint 的 metadata 与实际权重形状冲突时构造出
+    无法 load 或语义错配的模型。
 
     Args:
         state_dict: 模型 state_dict
@@ -66,27 +68,26 @@ def infer_transformer_config_from_state_dict(
     meta.setdefault('model_arch', 'transformer')
 
     # d_model: token_embedding.weight shape [vocab_size, d_model]
-    if 'd_model' not in meta and 'token_embedding.weight' in state_dict:
+    if 'token_embedding.weight' in state_dict:
         meta['d_model'] = state_dict['token_embedding.weight'].shape[1]
 
     # n_concept: concept_tokens shape [n_concept, d_model]
-    if 'n_concept' not in meta and 'concept_tokens' in state_dict:
+    if 'concept_tokens' in state_dict:
         meta['n_concept'] = state_dict['concept_tokens'].shape[0]
 
     # max_len: pos_embedding shape [1, max_len, d_model]
-    if 'max_len' not in meta and 'backbone.pos_embedding' in state_dict:
+    if 'backbone.pos_embedding' in state_dict:
         meta['max_len'] = state_dict['backbone.pos_embedding'].shape[1]
 
     # n_layers: count unique backbone.blocks.<idx> prefixes
-    if 'n_layers' not in meta:
-        layer_ids = set()
-        for k in state_dict:
-            if k.startswith('backbone.blocks.'):
-                parts = k.split('.')
-                if len(parts) >= 3 and parts[2].isdigit():
-                    layer_ids.add(int(parts[2]))
-        if layer_ids:
-            meta['n_layers'] = max(layer_ids) + 1
+    layer_ids = set()
+    for k in state_dict:
+        if k.startswith('backbone.blocks.'):
+            parts = k.split('.')
+            if len(parts) >= 3 and parts[2].isdigit():
+                layer_ids.add(int(parts[2]))
+    if layer_ids:
+        meta['n_layers'] = max(layer_ids) + 1
 
     # n_heads 无法从权重形状可靠推断，保留为 None
     return meta
